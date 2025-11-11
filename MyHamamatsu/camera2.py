@@ -321,7 +321,6 @@ class CameraDevice:
                     # disable mode if writable (prefer explicit OFF value if supported)
                     if prev_mode is not None:
                         disable_value = float(DCAMPROP_MODE__OFF)
-                        # avoid writing OFF if target is already OFF (should be rare, but defensive)
                         if abs(disable_value - _resolve_target_mode()) < 1e-6:
                             disable_value = prev_mode
                         try:

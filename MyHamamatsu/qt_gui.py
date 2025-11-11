@@ -30,13 +30,28 @@ class FrameWorker(QtCore.QObject):
         super().__init__(parent)
         self.camera = camera
         self._running = False
+        self._preview_interval = 1.0 / 15.0  # default 15 FPS preview
+        self._last_emit = 0.0
+        self._thread = None
 
     def start(self):
+        if self._thread and self._thread.is_alive():
+            return
         self._running = True
-        threading.Thread(target=self._run, daemon=True).start()
+        self._last_emit = 0.0
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
 
     def stop(self):
         self._running = False
+        if self._thread:
+            self._thread.join(timeout=2.0)
+            self._thread = None
+
+    def set_preview_fps(self, fps: float):
+        if fps < 1:
+            fps = 1.0
+        self._preview_interval = 1.0 / float(fps)
 
     def _run(self):
         while self._running:
@@ -64,8 +79,57 @@ class FrameWorker(QtCore.QObject):
                 continue
 
             img8, img16, idx, fr = res
+            now = time.time()
+            if now - self._last_emit < self._preview_interval:
+                continue
+            self._last_emit = now
             img_rgb = cv2.cvtColor(img8, cv2.COLOR_GRAY2RGB)
             self.frame_ready.emit(img_rgb, img16)
+
+
+class SaveWorker(QtCore.QObject):
+    progress = QtCore.pyqtSignal(int, float)
+    finished = QtCore.pyqtSignal(bool, str, int)
+
+    def __init__(self, camera: CameraDevice, path: str, frame_limit: int, duration_limit: float):
+        super().__init__()
+        self.camera = camera
+        self.path = path
+        self.frame_limit = int(frame_limit)
+        self.duration_limit = float(duration_limit)
+        self._abort = False
+
+    @QtCore.pyqtSlot()
+    def run(self):
+        saved = 0
+        start_time = time.time()
+        try:
+            self.camera.start()
+            with open(self.path, 'wb') as f:
+                while not self._abort:
+                    if self.frame_limit > 0 and saved >= self.frame_limit:
+                        break
+                    if self.duration_limit > 0 and (time.time() - start_time) >= self.duration_limit:
+                        break
+                    res = self.camera.get_frame(timeout_ms=2000)
+                    if not res:
+                        continue
+                    img8, img16, idx, fr = res
+                    arr = np.ascontiguousarray(img16, dtype=np.uint16)
+                    f.write(arr.astype('<u2').tobytes())
+                    saved += 1
+                    self.progress.emit(saved, time.time() - start_time)
+            self.finished.emit(True, '', saved)
+        except Exception as e:
+            self.finished.emit(False, str(e), saved)
+        finally:
+            try:
+                self.camera.stop()
+            except Exception:
+                pass
+
+    def stop(self):
+        self._abort = True
 
 
 class CameraWindow(QtWidgets.QMainWindow):
@@ -85,6 +149,10 @@ class CameraWindow(QtWidgets.QMainWindow):
         self.preview_label.setMinimumSize(640, 480)
         layout.addWidget(self.preview_label)
 
+        self.fps_label = QtWidgets.QLabel('FPS: --')
+        self.fps_label.setAlignment(QtCore.Qt.AlignCenter)
+        layout.addWidget(self.fps_label)
+
         # Controls
         ctrl = QtWidgets.QHBoxLayout()
 
@@ -92,8 +160,8 @@ class CameraWindow(QtWidgets.QMainWindow):
         self.btn_start.clicked.connect(self.on_start_stop)
         ctrl.addWidget(self.btn_start)
 
-        self.btn_capture = QtWidgets.QPushButton('Save .bin')
-        self.btn_capture.clicked.connect(self.on_save_bin)
+        self.btn_capture = QtWidgets.QPushButton('Save Burst')
+        self.btn_capture.clicked.connect(self.on_save_burst)
         ctrl.addWidget(self.btn_capture)
 
         ctrl.addWidget(QtWidgets.QLabel('Exposure'))
@@ -111,16 +179,75 @@ class CameraWindow(QtWidgets.QMainWindow):
 
         layout.addLayout(ctrl)
 
+        # ROI controls row
+        roi_ctrl = QtWidgets.QHBoxLayout()
+        roi_ctrl.addWidget(QtWidgets.QLabel('HPOS'))
+        self.spin_hpos = QtWidgets.QSpinBox()
+        self.spin_hpos.setRange(0, 16384)
+        self.spin_hpos.setValue(0)
+        roi_ctrl.addWidget(self.spin_hpos)
+
+        roi_ctrl.addWidget(QtWidgets.QLabel('VPOS'))
+        self.spin_vpos = QtWidgets.QSpinBox()
+        self.spin_vpos.setRange(0, 16384)
+        self.spin_vpos.setValue(0)
+        roi_ctrl.addWidget(self.spin_vpos)
+
+        roi_ctrl.addWidget(QtWidgets.QLabel('HSIZE'))
+        self.spin_hsize = QtWidgets.QSpinBox()
+        self.spin_hsize.setRange(2, 16384)
+        self.spin_hsize.setSingleStep(2)
+        roi_ctrl.addWidget(self.spin_hsize)
+
+        roi_ctrl.addWidget(QtWidgets.QLabel('VSIZE'))
+        self.spin_vsize = QtWidgets.QSpinBox()
+        self.spin_vsize.setRange(2, 16384)
+        self.spin_vsize.setSingleStep(2)
+        roi_ctrl.addWidget(self.spin_vsize)
+
+        self.btn_apply_roi = QtWidgets.QPushButton('Apply ROI')
+        self.btn_apply_roi.setToolTip('Apply ROI using CameraDevice.set_subarray()')
+        self.btn_apply_roi.clicked.connect(self.on_apply_roi)
+        roi_ctrl.addWidget(self.btn_apply_roi)
+
+        roi_ctrl.addWidget(QtWidgets.QLabel('Preview FPS'))
+        self.spin_preview_fps = QtWidgets.QSpinBox()
+        self.spin_preview_fps.setRange(1, 60)
+        self.spin_preview_fps.setValue(15)
+        self.spin_preview_fps.valueChanged.connect(self.on_preview_fps_changed)
+        roi_ctrl.addWidget(self.spin_preview_fps)
+
+        roi_ctrl.addWidget(QtWidgets.QLabel('Frames to save'))
+        self.spin_save_frames = QtWidgets.QSpinBox()
+        self.spin_save_frames.setRange(0, 1000000)
+        self.spin_save_frames.setValue(1000)
+        roi_ctrl.addWidget(self.spin_save_frames)
+
+        roi_ctrl.addWidget(QtWidgets.QLabel('Duration (s)'))
+        self.spin_save_secs = QtWidgets.QDoubleSpinBox()
+        self.spin_save_secs.setRange(0.0, 3600.0)
+        self.spin_save_secs.setDecimals(1)
+        self.spin_save_secs.setValue(0.0)
+        roi_ctrl.addWidget(self.spin_save_secs)
+
+        layout.addLayout(roi_ctrl)
+
         # Status bar
         self.status = self.statusBar()
 
         # frame worker
         self.worker = FrameWorker(self.camera)
         self.worker.frame_ready.connect(self.on_frame_ready)
+        self.worker.set_preview_fps(self.spin_preview_fps.value())
 
         self.last_rgb = None
         self.last_16 = None
         self.running = False
+        self._frame_times = []
+        self.save_thread = None
+        self.save_worker = None
+        self._resume_preview_after_save = False
+        self._last_save_path = None
 
         # Map slider to exposure range using a logarithmic mapping (slider 0..SMAX)
         self.SMAX = 1000
@@ -176,6 +303,17 @@ class CameraWindow(QtWidgets.QMainWindow):
             self.exp_slider.setValue(0)
             self.exp_edit.setText(str(self.current_exposure))
 
+        # initialize ROI spin boxes to current camera geometry
+        try:
+            width = int(getattr(self.camera, 'width', 0) or 0)
+            height = int(getattr(self.camera, 'height', 0) or 0)
+            if width > 0:
+                self.spin_hsize.setValue(width)
+            if height > 0:
+                self.spin_vsize.setValue(height)
+        except Exception:
+            pass
+
     def on_start_stop(self):
         if not self.running:
             try:
@@ -210,19 +348,64 @@ class CameraWindow(QtWidgets.QMainWindow):
         pix = QtGui.QPixmap.fromImage(qimg).scaled(self.preview_label.size(), QtCore.Qt.KeepAspectRatio, QtCore.Qt.SmoothTransformation)
         self.preview_label.setPixmap(pix)
 
-    def on_save_bin(self):
-        if self.last_16 is None:
-            QtWidgets.QMessageBox.information(self, 'No frame', 'No frame available to save')
+        # update FPS label
+        now = time.time()
+        self._frame_times.append(now)
+        # keep last 2 seconds of timestamps
+        while self._frame_times and now - self._frame_times[0] > 2.0:
+            self._frame_times.pop(0)
+        fps = 0.0
+        if len(self._frame_times) >= 2:
+            dt = self._frame_times[-1] - self._frame_times[0]
+            if dt > 0:
+                fps = (len(self._frame_times) - 1) / dt
+        self.fps_label.setText(f'FPS: {fps:.1f}  ({w}x{h})')
+
+    def on_save_burst(self):
+        if self.save_thread is not None:
+            QtWidgets.QMessageBox.information(self, 'Saving', 'A save operation is already running.')
             return
-        fname, _ = QtWidgets.QFileDialog.getSaveFileName(self, 'Save raw frame', f'frame_{datetime.now().strftime("%Y%m%d_%H%M%S")}.bin', 'Binary files (*.bin)')
+
+        frame_limit = int(self.spin_save_frames.value())
+        duration_limit = float(self.spin_save_secs.value())
+        if frame_limit <= 0 and duration_limit <= 0:
+            QtWidgets.QMessageBox.warning(self, 'Invalid settings', 'Set either a positive frame count or duration.')
+            return
+
+        fname, _ = QtWidgets.QFileDialog.getSaveFileName(
+            self,
+            'Save burst',
+            f'burst_{datetime.now().strftime("%Y%m%d_%H%M%S")}.bin',
+            'Binary files (*.bin)'
+        )
         if not fname:
             return
-        try:
-            # save raw uint16 little-endian
-            self.last_16.astype('<u2').tofile(fname)
-            QtWidgets.QMessageBox.information(self, 'Saved', f'Saved: {fname}')
-        except Exception as e:
-            QtWidgets.QMessageBox.critical(self, 'Save failed', str(e))
+
+        self._last_save_path = fname
+        self._resume_preview_after_save = self.running
+        if self.running:
+            self.worker.stop()
+            try:
+                self.camera.stop()
+            except Exception:
+                pass
+            self.running = False
+            self.btn_start.setText('Start')
+            self.status.showMessage('Preview paused for saving...', 3000)
+
+        self.btn_capture.setEnabled(False)
+
+        self.save_thread = QtCore.QThread()
+        self.save_worker = SaveWorker(self.camera, fname, frame_limit, duration_limit)
+        self.save_worker.moveToThread(self.save_thread)
+        self.save_thread.started.connect(self.save_worker.run)
+        self.save_worker.progress.connect(self.on_save_progress)
+        self.save_worker.finished.connect(self.on_save_finished)
+        self.save_worker.finished.connect(self.save_thread.quit)
+        self.save_worker.finished.connect(self.save_worker.deleteLater)
+        self.save_thread.finished.connect(self._cleanup_save_thread)
+        self.save_thread.start()
+        self.status.showMessage('Saving frames...', 0)
 
     def on_exp_changed(self, val):
         # map slider position -> exposure (log mapping + quantize)
@@ -282,6 +465,53 @@ class CameraWindow(QtWidgets.QMainWindow):
         except Exception as e:
             QtWidgets.QMessageBox.warning(self, 'Exposure error', f'{e}')
 
+    def on_apply_roi(self):
+        hpos = int(self.spin_hpos.value())
+        vpos = int(self.spin_vpos.value())
+        hsize = int(self.spin_hsize.value())
+        vsize = int(self.spin_vsize.value())
+        try:
+            self.camera.set_subarray(hpos, vpos, hsize, vsize, mode=2)
+            self.status.showMessage(f'ROI applied: HPOS={hpos} VPOS={vpos} HSIZE={hsize} VSIZE={vsize}', 5000)
+        except Exception as e:
+            QtWidgets.QMessageBox.critical(self, 'ROI failed', f'Failed to set ROI: {e}')
+
+    def on_preview_fps_changed(self, value: int):
+        try:
+            self.worker.set_preview_fps(float(value))
+            self.status.showMessage(f'Preview FPS limited to {value}', 3000)
+        except Exception:
+            pass
+
+    def on_save_progress(self, frames_saved: int, elapsed: float):
+        rate = 0.0
+        if elapsed > 0:
+            rate = frames_saved / elapsed
+        self.status.showMessage(f'Saving... frames={frames_saved} ({rate:.1f} FPS)', 0)
+
+    def on_save_finished(self, success: bool, error: str, frames_saved: int):
+        self.btn_capture.setEnabled(True)
+        if success:
+            QtWidgets.QMessageBox.information(
+                self,
+                'Save complete',
+                f'Saved {frames_saved} frames to:\n{self._last_save_path}'
+            )
+            self.status.showMessage(f'Saved {frames_saved} frames', 5000)
+        else:
+            QtWidgets.QMessageBox.critical(self, 'Save failed', error or 'Unknown error')
+            self.status.showMessage('Save failed', 5000)
+
+        if self._resume_preview_after_save:
+            self._resume_preview_after_save = False
+            if not self.running:
+                self.on_start_stop()
+
+    def _cleanup_save_thread(self):
+        if self.save_thread:
+            self.save_thread.deleteLater()
+            self.save_thread = None
+            self.save_worker = None
 
 def main():
     cam = CameraDevice(cam_index=0)
