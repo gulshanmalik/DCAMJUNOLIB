@@ -278,7 +278,7 @@ class SaveWorker:
 
 
 class HistogramWidget(Gtk.DrawingArea):
-    """Custom histogram widget with draggable black/white level handles."""
+    """Vertical histogram with integrated draggable range handles."""
 
     __gsignals__ = {
         'levels-changed': (GObject.SIGNAL_RUN_FIRST, None, (int, int)),
@@ -290,8 +290,10 @@ class HistogramWidget(Gtk.DrawingArea):
         self._hist = np.zeros(self._bins, dtype=np.int64)
         self._min_level = 0
         self._max_level = 65535
+        self._view_low = 0
+        self._view_high = 65535
         self._active_handle = None
-        self.set_size_request(-1, 140)
+        self.set_size_request(-1, 160)
         self.add_events(
             Gdk.EventMask.BUTTON_PRESS_MASK |
             Gdk.EventMask.BUTTON_RELEASE_MASK |
@@ -310,6 +312,7 @@ class HistogramWidget(Gtk.DrawingArea):
             if arr.size != self._bins:
                 arr = np.resize(arr, self._bins)
             self._hist = arr.astype(np.int64, copy=False)
+        self._auto_zoom_view()
         self.queue_draw()
 
     def set_level_range(self, low: int, high: int, emit_signal: bool = False):
@@ -319,6 +322,7 @@ class HistogramWidget(Gtk.DrawingArea):
             return
         self._min_level = low
         self._max_level = high
+        self._ensure_view_contains_levels()
         self.queue_draw()
         if emit_signal:
             self.emit('levels-changed', self._min_level, self._max_level)
@@ -326,24 +330,61 @@ class HistogramWidget(Gtk.DrawingArea):
     def _hist_rect(self):
         alloc = self.get_allocation()
         margin_x = 12
-        margin_top = 12
-        margin_bottom = 28
+        margin_y = 10
         width = max(1, alloc.width - 2 * margin_x)
-        height = max(1, alloc.height - (margin_top + margin_bottom))
-        return margin_x, margin_top, width, height
+        height = max(1, alloc.height - 2 * margin_y)
+        return margin_x, margin_y, width, height
 
-    def _level_to_x(self, level: int, rect):
-        x, _, width, _ = rect
-        t = float(level) / 65535.0
-        return x + t * width
-
-    def _x_to_level(self, xpos: float, rect):
-        x, _, width, _ = rect
-        if width <= 0:
-            return 0
-        t = (xpos - x) / width
+    def _level_to_y(self, level: int, rect):
+        level = max(0, min(65535, int(level)))
+        span = max(1, self._view_high - self._view_low)
+        t = (level - self._view_low) / span
         t = max(0.0, min(1.0, t))
-        return int(round(t * 65535))
+        x, y, _, height = rect
+        return y + height - t * height
+
+    def _y_to_level(self, ypos: float, rect):
+        x, y, _, height = rect
+        if height <= 0:
+            return 0
+        t = (y + height - ypos) / height
+        t = max(0.0, min(1.0, t))
+        level = self._view_low + t * (self._view_high - self._view_low)
+        return int(round(max(0, min(65535, level))))
+
+    def _auto_zoom_view(self):
+        arr = self._hist
+        total = int(arr.sum())
+        if total <= 0:
+            self._view_low = 0
+            self._view_high = 65535
+            return
+        cumsum = np.cumsum(arr)
+        low_idx = int(np.searchsorted(cumsum, total * 0.01))
+        high_idx = int(np.searchsorted(cumsum, total * 0.99))
+        bin_width = 65535 / max(1, self._bins)
+        start = low_idx * bin_width
+        end = (high_idx + 1) * bin_width
+        if end <= start:
+            end = start + bin_width
+        span = end - start
+        margin = max(100.0, span * 0.5)
+        self._view_low = int(max(0.0, start - margin))
+        self._view_high = int(min(65535.0, end + margin))
+        if self._view_high <= self._view_low:
+            self._view_high = min(65535, self._view_low + 1)
+        self._ensure_view_contains_levels()
+
+    def _ensure_view_contains_levels(self):
+        changed = False
+        if self._min_level < self._view_low:
+            self._view_low = max(0, self._min_level - 100)
+            changed = True
+        if self._max_level > self._view_high:
+            self._view_high = min(65535, self._max_level + 100)
+            changed = True
+        if changed and self._view_high <= self._view_low:
+            self._view_high = min(65535, self._view_low + 1)
 
     def _on_draw(self, _widget, cr: cairo.Context):
         alloc = self.get_allocation()
@@ -359,59 +400,61 @@ class HistogramWidget(Gtk.DrawingArea):
 
         max_count = int(self._hist.max()) if self._hist.size else 0
         max_count = max(1, max_count)
-        bar_width = rw / float(self._bins)
+        bin_width_level = 65535 / max(1, self._bins)
         cr.set_source_rgba(0.47, 0.71, 1.0, 0.8)
 
         for i in range(self._bins):
             count = self._hist[i]
-            height = rh * (count / max_count)
-            bar_x = rx + i * bar_width
-            cr.rectangle(bar_x, ry + rh - height, bar_width, height)
+            if count <= 0:
+                continue
+            bin_low = i * bin_width_level
+            bin_high = (i + 1) * bin_width_level
+            if bin_high < self._view_low or bin_low > self._view_high:
+                continue
+            y_high = self._level_to_y(bin_low, rect)
+            y_low = self._level_to_y(bin_high, rect)
+            y_top = min(y_high, y_low)
+            bar_height = abs(y_high - y_low)
+            bar_width = rw * (count / max_count)
+            cr.rectangle(rx, y_top, bar_width, bar_height)
         cr.fill()
 
-        # handles
         cr.set_source_rgb(1.0, 0.78, 0.0)
         cr.set_line_width(2)
         for level in (self._min_level, self._max_level):
-            hx = self._level_to_x(level, rect)
-            cr.move_to(hx, ry)
-            cr.line_to(hx, ry + rh)
+            y_pos = self._level_to_y(level, rect)
+            cr.move_to(rx, y_pos)
+            cr.line_to(rx + rw, y_pos)
             cr.stroke()
-            cr.move_to(hx - 6, ry + rh + 8)
-            cr.line_to(hx + 6, ry + rh + 8)
-            cr.line_to(hx, ry + rh + 18)
-            cr.close_path()
+            cr.rectangle(rx + rw - 12, y_pos - 4, 12, 8)
             cr.fill()
 
         cr.set_source_rgb(0.78, 0.78, 0.78)
-        cr.set_font_size(11)
-        min_text = str(self._min_level)
-        max_text = str(self._max_level)
-        cr.move_to(rx, ry - 4)
-        cr.show_text(min_text)
-        max_extents = cr.text_extents(max_text)
-        cr.move_to(rx + rw - max_extents.width, ry - 4)
-        cr.show_text(max_text)
+        cr.set_font_size(10)
+        cr.move_to(rx + 4, ry + 12)
+        cr.show_text(f"{self._view_high}")
+        cr.move_to(rx + 4, ry + rh - 4)
+        cr.show_text(f"{self._view_low}")
         return False
 
     def _on_button_press(self, _widget, event):
         if event.button != 1:
             return False
         rect = self._hist_rect()
-        rx, ry, rw, rh = rect
-        if not (rx <= event.x <= rx + rw and ry <= event.y <= ry + rh):
+        x, y, w, h = rect
+        if not (x <= event.x <= x + w and y <= event.y <= y + h):
             return False
-        x_min = self._level_to_x(self._min_level, rect)
-        x_max = self._level_to_x(self._max_level, rect)
-        self._active_handle = 'min' if abs(event.x - x_min) <= abs(event.x - x_max) else 'max'
-        self._update_handle_from_pos(event.x, rect)
+        y_min = self._level_to_y(self._min_level, rect)
+        y_max = self._level_to_y(self._max_level, rect)
+        self._active_handle = 'min' if abs(event.y - y_min) <= abs(event.y - y_max) else 'max'
+        self._update_handle_from_pos(event.y, rect)
         return True
 
     def _on_motion(self, _widget, event):
         if not self._active_handle:
             return False
         rect = self._hist_rect()
-        self._update_handle_from_pos(event.x, rect)
+        self._update_handle_from_pos(event.y, rect)
         return True
 
     def _on_button_release(self, _widget, event):
@@ -419,13 +462,12 @@ class HistogramWidget(Gtk.DrawingArea):
             self._active_handle = None
         return False
 
-    def _update_handle_from_pos(self, xpos: float, rect):
-        level = self._x_to_level(xpos, rect)
+    def _update_handle_from_pos(self, ypos: float, rect):
+        level = self._y_to_level(ypos, rect)
         if self._active_handle == 'min':
             self.set_level_range(level, self._max_level, emit_signal=True)
         elif self._active_handle == 'max':
             self.set_level_range(self._min_level, level, emit_signal=True)
-
 
 class CameraWindow(Gtk.Window):
     def __init__(self, camera: CameraDevice):
@@ -441,7 +483,47 @@ class CameraWindow(Gtk.Window):
         content = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
         root.pack_start(content, True, True, 0)
 
-        # Left panel: preview + fps
+        # Histogram column (left side of preview)
+        hist_column = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        hist_column.set_border_width(4)
+        hist_column.set_size_request(190, -1)
+        content.pack_start(hist_column, False, False, 0)
+
+        hist_frame = Gtk.Frame(label='Histogram / Display Range')
+        hist_frame.set_vexpand(True)
+        hist_column.pack_start(hist_frame, True, True, 0)
+        hist_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        hist_box.set_border_width(6)
+        hist_frame.add(hist_box)
+
+        self.auto_levels_check = Gtk.CheckButton(label='Auto display range')
+        self.auto_levels_check.set_active(True)
+        self.auto_levels_check.connect('toggled', self.on_auto_levels_toggled)
+        hist_box.pack_start(self.auto_levels_check, False, False, 0)
+
+        self.hist_widget = HistogramWidget()
+        self.hist_widget.set_vexpand(True)
+        self.hist_widget.connect('levels-changed', self.on_hist_levels_changed)
+        hist_box.pack_start(self.hist_widget, True, True, 0)
+
+        levels_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        hist_box.pack_start(levels_box, False, False, 0)
+
+        black_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        levels_box.pack_start(black_row, False, False, 0)
+        black_row.pack_start(Gtk.Label(label='Black'), False, False, 0)
+        self.spin_black = Gtk.SpinButton.new_with_range(0, 65534, 1)
+        self.spin_black.connect('value-changed', self.on_black_level_changed)
+        black_row.pack_start(self.spin_black, True, True, 0)
+
+        white_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        levels_box.pack_start(white_row, False, False, 0)
+        white_row.pack_start(Gtk.Label(label='White'), False, False, 0)
+        self.spin_white = Gtk.SpinButton.new_with_range(1, 65535, 1)
+        self.spin_white.connect('value-changed', self.on_white_level_changed)
+        white_row.pack_start(self.spin_white, True, True, 0)
+
+        # Center panel: preview + fps
         left_panel = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
         content.pack_start(left_panel, True, True, 0)
 
@@ -516,16 +598,21 @@ class CameraWindow(Gtk.Window):
         self.spin_hsize = grid_spin('HSIZE', 2, 16384, 2, 2)
         self.spin_vsize = grid_spin('VSIZE', 2, 16384, 2, 3)
 
+        self.btn_maximize_roi = Gtk.Button(label='Maximize')
+        self.btn_maximize_roi.set_tooltip_text('Reset ROI to full sensor resolution')
+        self.btn_maximize_roi.connect('clicked', self.on_maximize_roi)
+        roi_grid.attach(self.btn_maximize_roi, 0, 4, 2, 1)
+
         self.btn_apply_roi = Gtk.Button(label='Apply ROI')
         self.btn_apply_roi.set_tooltip_text('Apply ROI using CameraDevice.set_subarray()')
         self.btn_apply_roi.connect('clicked', self.on_apply_roi)
-        roi_grid.attach(self.btn_apply_roi, 0, 4, 2, 1)
+        roi_grid.attach(self.btn_apply_roi, 0, 5, 2, 1)
 
-        self.spin_preview_fps = grid_spin('Preview FPS', 1, 60, 1, 5)
+        self.spin_preview_fps = grid_spin('Preview FPS', 1, 60, 1, 6)
         self.spin_preview_fps.set_value(15)
         self.spin_preview_fps.connect('value-changed', self.on_preview_fps_changed)
 
-        self.spin_save_frames = grid_spin('Frames to save', 0, 1_000_000, 1, 6)
+        self.spin_save_frames = grid_spin('Frames to save', 0, 1_000_000, 1, 7)
         self.spin_save_frames.set_value(1000)
 
         self.spin_save_secs = Gtk.SpinButton.new_with_range(0.0, 3600.0, 0.1)
@@ -533,32 +620,8 @@ class CameraWindow(Gtk.Window):
         self.spin_save_secs.set_value(0.0)
         lbl_duration = Gtk.Label(label='Duration (s)')
         lbl_duration.set_xalign(0)
-        roi_grid.attach(lbl_duration, 0, 7, 1, 1)
-        roi_grid.attach(self.spin_save_secs, 1, 7, 1, 1)
-
-        hist_frame = Gtk.Frame(label='Histogram / Display Range')
-        right_panel.pack_start(hist_frame, True, True, 0)
-        hist_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
-        hist_box.set_border_width(4)
-        hist_frame.add(hist_box)
-
-        self.hist_widget = HistogramWidget()
-        self.hist_widget.connect('levels-changed', self.on_hist_levels_changed)
-        hist_box.pack_start(self.hist_widget, True, True, 0)
-
-        levels_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
-        hist_box.pack_start(levels_box, False, False, 0)
-
-        levels_box.pack_start(Gtk.Label(label='Black level'), False, False, 0)
-        self.spin_black = Gtk.SpinButton.new_with_range(0, 65534, 1)
-        self.spin_black.connect('value-changed', self.on_black_level_changed)
-        levels_box.pack_start(self.spin_black, False, False, 0)
-
-        levels_box.pack_start(Gtk.Label(label='White level'), False, False, 0)
-        self.spin_white = Gtk.SpinButton.new_with_range(1, 65535, 1)
-        self.spin_white.connect('value-changed', self.on_white_level_changed)
-        levels_box.pack_start(self.spin_white, False, False, 0)
-        levels_box.pack_start(Gtk.Label(), True, True, 0)
+        roi_grid.attach(lbl_duration, 0, 8, 1, 1)
+        roi_grid.attach(self.spin_save_secs, 1, 8, 1, 1)
 
         # Status bar
         self.status = Gtk.Statusbar()
@@ -589,6 +652,7 @@ class CameraWindow(Gtk.Window):
         self._last_save_path = None
         self._last_metadata_path = None
         self._frame_error_reported = False
+        self.auto_levels_enabled = True
 
         self._updating_exp_slider = False
         self._updating_exp_entry = False
@@ -725,6 +789,8 @@ class CameraWindow(Gtk.Window):
         if hist is not None:
             self.last_hist = hist
             self.hist_widget.set_histogram(hist)
+            if self.auto_levels_enabled:
+                self._auto_adjust_levels_from_hist(hist)
 
         self._latest_pixbuf = self._numpy_to_pixbuf(img_rgb)
         self.preview_area.queue_draw()
@@ -799,6 +865,8 @@ class CameraWindow(Gtk.Window):
         self._set_display_levels(low, value, source='white_spin')
 
     def _set_display_levels(self, low, high, source=None):
+        if source in ('hist', 'black_spin', 'white_spin') and self.auto_levels_enabled:
+            self.auto_levels_check.set_active(False)
         low = max(0, min(int(low), 65535))
         high = max(low + 1, min(int(high), 65535))
         if low == self.display_min and high == self.display_max:
@@ -813,6 +881,33 @@ class CameraWindow(Gtk.Window):
             self._set_spin_value(self.spin_white, high, '_block_white_spin')
         if self.worker:
             self.worker.set_display_levels(low, high)
+
+    def on_auto_levels_toggled(self, button):
+        self.auto_levels_enabled = bool(button.get_active())
+        if self.auto_levels_enabled and self.last_hist is not None:
+            self._auto_adjust_levels_from_hist(self.last_hist)
+
+    def _auto_adjust_levels_from_hist(self, hist):
+        try:
+            arr = np.asarray(hist, dtype=np.int64).flatten()
+        except Exception:
+            return
+        if arr.size == 0:
+            return
+        total = int(arr.sum())
+        if total <= 0:
+            return
+        cumsum = np.cumsum(arr)
+        low_target = max(0, total * 0.01)
+        high_target = max(low_target + 1, total * 0.99)
+        low_idx = int(np.searchsorted(cumsum, low_target))
+        high_idx = int(np.searchsorted(cumsum, high_target))
+        if high_idx <= low_idx:
+            high_idx = min(arr.size - 1, low_idx + 1)
+        bin_width = 65535 / max(1, arr.size - 1)
+        low_level = int(max(0, min(65535, round(low_idx * bin_width))))
+        high_level = int(max(low_level + 1, min(65535, round((high_idx + 1) * bin_width))))
+        self._set_display_levels(low_level, high_level, source='auto')
 
     def on_preview_fps_changed(self, spin):
         try:
@@ -963,11 +1058,53 @@ class CameraWindow(Gtk.Window):
         vpos = int(self.spin_vpos.get_value())
         hsize = int(self.spin_hsize.get_value())
         vsize = int(self.spin_vsize.get_value())
+        was_running = self.running
+        if was_running:
+            self._pause_preview('Pausing preview to apply ROI...')
         try:
             self.camera.set_subarray(hpos, vpos, hsize, vsize, mode=2)
-            self.show_status(f'ROI applied: HPOS={hpos} VPOS={vpos} HSIZE={hsize} VSIZE={vsize}', 5000)
         except Exception as e:
             self.show_error('ROI failed', f'Failed to set ROI: {e}')
+            if was_running:
+                self._resume_preview('Preview resumed (ROI unchanged)')
+            return
+        msg = f'ROI applied: HPOS={hpos} VPOS={vpos} HSIZE={hsize} VSIZE={vsize}'
+        if was_running:
+            if not self._resume_preview(msg):
+                return
+        else:
+            self.show_status(msg, 5000)
+
+    def on_maximize_roi(self, _button):
+        try:
+            info = self.camera.get_subarray_info()
+        except Exception as e:
+            self.show_error('ROI failed', f'Failed to query camera info: {e}')
+            return
+
+        def _extract_max(attr_tuple):
+            if not attr_tuple:
+                return None
+            try:
+                return int(attr_tuple[1])
+            except Exception:
+                return None
+
+        max_width = _extract_max(info.get('sub_h_attr'))
+        max_height = _extract_max(info.get('sub_v_attr'))
+        if not max_width:
+            max_width = int(info.get('full_width') or getattr(self.camera, 'width', 0) or 0)
+        if not max_height:
+            max_height = int(info.get('full_height') or getattr(self.camera, 'height', 0) or 0)
+        if max_width <= 0 or max_height <= 0:
+            self.show_error('ROI failed', 'Camera did not report maximum dimensions.')
+            return
+
+        self.spin_hpos.set_value(0)
+        self.spin_vpos.set_value(0)
+        self.spin_hsize.set_value(max_width)
+        self.spin_vsize.set_value(max_height)
+        self.on_apply_roi(None)
 
     def show_error(self, title: str, message: str):
         self._show_message(Gtk.MessageType.ERROR, title, message)
@@ -986,6 +1123,31 @@ class CameraWindow(Gtk.Window):
         dialog.format_secondary_text(message)
         dialog.run()
         dialog.destroy()
+
+    def _pause_preview(self, message='Preview paused'):
+        if not self.running:
+            return False
+        self.worker.stop()
+        try:
+            self.camera.stop()
+        except Exception:
+            pass
+        self.running = False
+        self.btn_start.set_label('Start')
+        self.show_status(message, 3000)
+        return True
+
+    def _resume_preview(self, message='Preview resumed'):
+        try:
+            self.camera.start()
+        except Exception as e:
+            self.show_error('Restart failed', f'Failed to restart camera: {e}')
+            return False
+        self.worker.start()
+        self.running = True
+        self.btn_start.set_label('Stop')
+        self.show_status(message, 5000)
+        return True
 
 
 def main():
