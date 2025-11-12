@@ -12,6 +12,11 @@ import time
 import numpy as np
 import cv2
 
+try:
+    from . import filters as img_filters
+except Exception:
+    import filters as img_filters
+
 import gi
 
 gi.require_version('Gtk', '3.0')
@@ -536,13 +541,20 @@ class CameraWindow(Gtk.Window):
         self.fps_label.set_justify(Gtk.Justification.CENTER)
         left_panel.pack_start(self.fps_label, False, False, 0)
 
-        # Right panel: all controls stacked vertically
+        # Right panel: Settings + Filters + Display sections
         right_panel = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
         right_panel.set_size_request(320, -1)
         content.pack_start(right_panel, False, False, 0)
 
+        settings_frame = Gtk.Frame(label='Settings')
+        settings_frame.set_vexpand(True)
+        right_panel.pack_start(settings_frame, True, True, 0)
+        settings_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+        settings_box.set_border_width(6)
+        settings_frame.add(settings_box)
+
         button_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
-        right_panel.pack_start(button_row, False, False, 0)
+        settings_box.pack_start(button_row, False, False, 0)
 
         self.btn_start = Gtk.Button(label='Start')
         self.btn_start.connect('clicked', self.on_start_stop)
@@ -553,7 +565,7 @@ class CameraWindow(Gtk.Window):
         button_row.pack_start(self.btn_capture, True, True, 0)
 
         exposure_frame = Gtk.Frame(label='Exposure')
-        right_panel.pack_start(exposure_frame, False, False, 0)
+        settings_box.pack_start(exposure_frame, False, False, 0)
         exp_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
         exp_box.set_border_width(6)
         exposure_frame.add(exp_box)
@@ -578,7 +590,7 @@ class CameraWindow(Gtk.Window):
         exp_box.pack_start(exp_entry_row, False, False, 0)
 
         roi_frame = Gtk.Frame(label='ROI / Acquisition')
-        right_panel.pack_start(roi_frame, False, False, 0)
+        settings_box.pack_start(roi_frame, False, False, 0)
         roi_grid = Gtk.Grid(column_spacing=6, row_spacing=4, column_homogeneous=False)
         roi_grid.set_border_width(6)
         roi_frame.add(roi_grid)
@@ -623,6 +635,35 @@ class CameraWindow(Gtk.Window):
         roi_grid.attach(lbl_duration, 0, 8, 1, 1)
         roi_grid.attach(self.spin_save_secs, 1, 8, 1, 1)
 
+        filters_frame = Gtk.Frame(label='Filters')
+        right_panel.pack_start(filters_frame, False, False, 0)
+        filters_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        filters_box.set_border_width(6)
+        filters_frame.add(filters_box)
+        self.chk_filter_smooth = Gtk.CheckButton(label='Smooth preview (Gaussian)')
+        self.chk_filter_smooth.connect('toggled', self.on_filter_smooth_toggled)
+        filters_box.pack_start(self.chk_filter_smooth, False, False, 0)
+        self.chk_filter_sharpen = Gtk.CheckButton(label='Sharpen preview')
+        self.chk_filter_sharpen.connect('toggled', self.on_filter_sharpen_toggled)
+        filters_box.pack_start(self.chk_filter_sharpen, False, False, 0)
+        self.chk_filter_mavg = Gtk.CheckButton(label='Moving average (5 frames)')
+        self.chk_filter_mavg.connect('toggled', self.on_filter_mavg_toggled)
+        filters_box.pack_start(self.chk_filter_mavg, False, False, 0)
+
+        display_frame = Gtk.Frame(label='Display Settings')
+        right_panel.pack_start(display_frame, False, False, 0)
+        display_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        display_box.set_border_width(6)
+        display_frame.add(display_box)
+        self.chk_show_fps = Gtk.CheckButton(label='Show FPS label')
+        self.chk_show_fps.set_active(True)
+        self.chk_show_fps.connect('toggled', self.on_display_show_fps_toggled)
+        display_box.pack_start(self.chk_show_fps, False, False, 0)
+        self.chk_keep_aspect = Gtk.CheckButton(label='Preserve aspect ratio')
+        self.chk_keep_aspect.set_active(True)
+        self.chk_keep_aspect.connect('toggled', self.on_display_keep_aspect_toggled)
+        display_box.pack_start(self.chk_keep_aspect, False, False, 0)
+
         # Status bar
         self.status = Gtk.Statusbar()
         self.status_context = self.status.get_context_id('status')
@@ -653,6 +694,13 @@ class CameraWindow(Gtk.Window):
         self._last_metadata_path = None
         self._frame_error_reported = False
         self.auto_levels_enabled = True
+        self.filter_smoothing = False
+        self.filter_sharpen = False
+        self.filter_mavg = img_filters.MovingAverageFilter(window=5)
+        self.filter_mavg_enabled = False
+        self.preview_keep_aspect = True
+        self.show_fps_overlay = True
+        self.fps_label.set_visible(self.show_fps_overlay)
 
         self._updating_exp_slider = False
         self._updating_exp_entry = False
@@ -784,7 +832,15 @@ class CameraWindow(Gtk.Window):
                 self._frame_error_reported = True
             return
         self._frame_error_reported = False
-        self.last_rgb = img_rgb
+        display_rgb = img_rgb
+        if self.filter_smoothing:
+            display_rgb = img_filters.gaussian_blur(display_rgb, ksize=5)
+        if self.filter_sharpen:
+            display_rgb = img_filters.sharpen(display_rgb)
+        if self.filter_mavg_enabled:
+            display_rgb = self.filter_mavg.apply(display_rgb)
+        display_rgb = np.clip(display_rgb, 0, 255).astype(np.uint8, copy=False)
+        self.last_rgb = display_rgb
         self.last_16 = img16
         if hist is not None:
             self.last_hist = hist
@@ -792,7 +848,7 @@ class CameraWindow(Gtk.Window):
             if self.auto_levels_enabled:
                 self._auto_adjust_levels_from_hist(hist)
 
-        self._latest_pixbuf = self._numpy_to_pixbuf(img_rgb)
+        self._latest_pixbuf = self._numpy_to_pixbuf(display_rgb)
         self.preview_area.queue_draw()
 
         now = time.time()
@@ -804,7 +860,7 @@ class CameraWindow(Gtk.Window):
             dt = self._frame_times[-1] - self._frame_times[0]
             if dt > 0:
                 fps = (len(self._frame_times) - 1) / dt
-        h, w, _ = img_rgb.shape
+        h, w, _ = display_rgb.shape
         self.fps_label.set_text(f'FPS: {fps:.1f}  ({w}x{h})')
 
     def _numpy_to_pixbuf(self, img_rgb: np.ndarray):
@@ -829,10 +885,14 @@ class CameraWindow(Gtk.Window):
             return False
         if alloc.width <= 0 or alloc.height <= 0:
             return False
-        scale = min(alloc.width / img_w, alloc.height / img_h)
-        scale = max(scale, 1.0 if alloc.width >= img_w and alloc.height >= img_h else scale)
-        new_w = max(1, int(img_w * scale))
-        new_h = max(1, int(img_h * scale))
+        if self.preview_keep_aspect:
+            scale = min(alloc.width / img_w, alloc.height / img_h)
+            scale = max(scale, 1.0 if alloc.width >= img_w and alloc.height >= img_h else scale)
+            new_w = max(1, int(img_w * scale))
+            new_h = max(1, int(img_h * scale))
+        else:
+            new_w = max(1, alloc.width)
+            new_h = max(1, alloc.height)
         draw_pixbuf = pixbuf if (new_w == img_w and new_h == img_h) else \
             pixbuf.scale_simple(new_w, new_h, GdkPixbuf.InterpType.BILINEAR)
         x = (alloc.width - new_w) / 2
@@ -843,6 +903,28 @@ class CameraWindow(Gtk.Window):
 
     def on_hist_levels_changed(self, _widget, low, high):
         self._set_display_levels(low, high, source='hist')
+
+    def on_filter_smooth_toggled(self, button):
+        self.filter_smoothing = bool(button.get_active())
+
+    def on_filter_sharpen_toggled(self, button):
+        self.filter_sharpen = bool(button.get_active())
+        if not self.filter_sharpen:
+            # nothing special, but keep placeholder for future cleanups
+            pass
+
+    def on_filter_mavg_toggled(self, button):
+        self.filter_mavg_enabled = bool(button.get_active())
+        if not self.filter_mavg_enabled:
+            self.filter_mavg.reset()
+
+    def on_display_show_fps_toggled(self, button):
+        self.show_fps_overlay = bool(button.get_active())
+        self.fps_label.set_visible(self.show_fps_overlay)
+
+    def on_display_keep_aspect_toggled(self, button):
+        self.preview_keep_aspect = bool(button.get_active())
+        self.preview_area.queue_draw()
 
     def on_black_level_changed(self, spin):
         if self._block_black_spin:
