@@ -62,3 +62,43 @@ class MovingAverageFilter:
     def reset(self):
         self._buffer.clear()
         self._accum = None
+
+class RollingMovingAverageDiff:
+    """Compute |avg_{t-N+2…t+1} - avg_{t-N+1…t}| with a sliding window."""
+
+    def __init__(self, length: int = 10, normalize: bool = True):
+        self.length = max(1, int(length))
+        self.base_filter = MovingAverageFilter(window=self.length)
+        self.prev_avg: Optional[np.ndarray] = None
+        self.normalize = normalize
+
+    def set_params(self, *, length: Optional[int] = None, normalize: Optional[bool] = None):
+        if length is not None and length != self.length:
+            self.length = max(1, int(length))
+            self.base_filter = MovingAverageFilter(window=self.length)
+            self.prev_avg = None
+        if normalize is not None:
+            self.normalize = bool(normalize)
+
+    def reset(self):
+        self.base_filter.reset()
+        self.prev_avg = None
+
+    def apply(self, frame: np.ndarray) -> Optional[np.ndarray]:
+        if frame is None:
+            return None
+        avg_frame = self.base_filter.apply(frame)
+        if avg_frame is None:
+            return None  # still filling the first N frames
+        avg_frame = avg_frame.astype(np.float32)
+        if self.prev_avg is None:
+            self.prev_avg = avg_frame
+            return None  # need one more average to take a diff
+        diff = np.abs(avg_frame - self.prev_avg)
+        self.prev_avg = avg_frame
+        if self.normalize:
+            max_val = diff.max()
+            if max_val > 0:
+                diff = (diff / max_val) * 255.0
+        return diff.astype(np.uint8)
+

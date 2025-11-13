@@ -79,6 +79,25 @@ def get_prop_attr(hdcam, prop_id: int):
     return float(attr.valuemin), float(attr.valuemax), float(attr.valuestep), float(attr.valuedefault)
 
 
+def _stretch_preview(img16: np.ndarray) -> np.ndarray:
+    """Stretch each 16-bit frame to the full 8-bit display range."""
+    if img16.size == 0:
+        return np.zeros_like(img16, dtype=np.uint8)
+    min_val = int(img16.min())
+    max_val = int(img16.max())
+    if max_val <= min_val:
+        return np.zeros_like(img16, dtype=np.uint8)
+    stretched = cv2.normalize(
+        img16,
+        None,
+        alpha=0,
+        beta=255,
+        norm_type=cv2.NORM_MINMAX,
+        dtype=cv2.CV_8U,
+    )
+    return stretched.astype(np.uint8, copy=False)
+
+
 # ----------------------------------------------------------------------
 # Camera wrapper class
 # ----------------------------------------------------------------------
@@ -554,7 +573,7 @@ class CameraDevice:
             arr = np.ctypeslib.as_array(buf_ptr.contents)
             img16 = arr.reshape(fr.height, row_words)
             img16 = img16[:, :fr.width]
-            img8 = (img16 / 256).astype("uint8")
+            img8 = _stretch_preview(img16)
 
             # return both 8-bit preview and original 16-bit frame
             return img8, img16, idx, fr
@@ -601,7 +620,7 @@ class CameraDevice:
                     arr = np.ctypeslib.as_array(buf_ptr.contents)
                     img16 = arr.reshape(fr.height, row_words)
                     img16 = img16[:, :fr.width]
-                    img8 = (img16 / 256).astype("uint8")
+                    img8 = _stretch_preview(img16)
 
                     return img8, img16, idx, fr
 
@@ -790,7 +809,7 @@ def main():
             img16 = img16[:, :fr.width]
 
             # convert 16-bit -> 8-bit for display
-            img8 = (img16 / 256).astype("uint8")
+            img8 = _stretch_preview(img16)
 
             # show in a window
             cv2.imshow("Hamamatsu Live", img8)

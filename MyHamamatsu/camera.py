@@ -79,6 +79,25 @@ def get_prop_attr(hdcam, prop_id: int):
     return float(attr.valuemin), float(attr.valuemax), float(attr.valuestep), float(attr.valuedefault)
 
 
+def _stretch_preview(img16: np.ndarray) -> np.ndarray:
+    """Stretch each 16-bit frame to the full 8-bit display range."""
+    if img16.size == 0:
+        return np.zeros_like(img16, dtype=np.uint8)
+    min_val = int(img16.min())
+    max_val = int(img16.max())
+    if max_val <= min_val:
+        return np.zeros_like(img16, dtype=np.uint8)
+    stretched = cv2.normalize(
+        img16,
+        None,
+        alpha=0,
+        beta=255,
+        norm_type=cv2.NORM_MINMAX,
+        dtype=cv2.CV_8U,
+    )
+    return stretched.astype(np.uint8, copy=False)
+
+
 # ----------------------------------------------------------------------
 # Camera wrapper class
 # ----------------------------------------------------------------------
@@ -224,16 +243,22 @@ class CameraDevice:
                     pass
 
                 # clamp/align ROI to device-supported increments where available
+                h_attr = None
+                v_attr = None
                 try:
                     # query SUBARRAY attributes (if driver exposes them)
-                    hmin, hmax, hstep, hdef = get_prop_attr(self.hdcam, DCAM_IDPROP_SUBARRAYHSIZE)
+                    h_attr = get_prop_attr(self.hdcam, DCAM_IDPROP_SUBARRAYHSIZE)
+                    hmin, hmax, hstep, hdef = h_attr
                 except Exception:
                     hmin = None
+                    hmax = None
                     hstep = None
                 try:
-                    vmin, vmax, vstep, vdef = get_prop_attr(self.hdcam, DCAM_IDPROP_SUBARRAYVSIZE)
+                    v_attr = get_prop_attr(self.hdcam, DCAM_IDPROP_SUBARRAYVSIZE)
+                    vmin, vmax, vstep, vdef = v_attr
                 except Exception:
                     vmin = None
+                    vmax = None
                     vstep = None
 
                 # ensure requested ROI fits within current full image size
@@ -244,11 +269,38 @@ class CameraDevice:
                     full_w = None
                     full_h = None
 
-                if full_w and full_h:
-                    if hpos < 0 or vpos < 0 or hsize <= 0 or vsize <= 0:
-                        raise RuntimeError('Invalid ROI values (negative or zero)')
-                    if hpos + hsize > full_w or vpos + vsize > full_h:
-                        raise RuntimeError(f'ROI out of bounds: full={full_w}x{full_h}, requested {hpos},{vpos} {hsize}x{vsize}')
+                # derive best-known bounds: prefer attribute maxima if they exceed current image size
+                width_bound = None
+                height_bound = None
+                if full_w and full_w > 0:
+                    width_bound = full_w
+                if h_attr:
+                    try:
+                        candidate = int(h_attr[1])
+                        if candidate > 0 and (width_bound is None or candidate > width_bound):
+                            width_bound = candidate
+                    except Exception:
+                        pass
+                if full_h and full_h > 0:
+                    height_bound = full_h
+                if v_attr:
+                    try:
+                        candidate = int(v_attr[1])
+                        if candidate > 0 and (height_bound is None or candidate > height_bound):
+                            height_bound = candidate
+                    except Exception:
+                        pass
+
+                if hpos < 0 or vpos < 0 or hsize <= 0 or vsize <= 0:
+                    raise RuntimeError('Invalid ROI values (negative or zero)')
+                if width_bound and (hpos + hsize > width_bound):
+                    raise RuntimeError(
+                        f'ROI out of bounds horizontally: limit={int(width_bound)}, requested end={hpos + hsize}'
+                    )
+                if height_bound and (vpos + vsize > height_bound):
+                    raise RuntimeError(
+                        f'ROI out of bounds vertically: limit={int(height_bound)}, requested end={vpos + vsize}'
+                    )
 
                 # quantize sizes to step if provided
                 if hstep and hstep > 0:
@@ -555,7 +607,7 @@ class CameraDevice:
             arr = np.ctypeslib.as_array(buf_ptr.contents)
             img16 = arr.reshape(fr.height, row_words)
             img16 = img16[:, :fr.width]
-            img8 = (img16 / 256).astype("uint8")
+            img8 = _stretch_preview(img16)
 
             # return both 8-bit preview and original 16-bit frame
             return img8, img16, idx, fr
@@ -602,7 +654,7 @@ class CameraDevice:
                     arr = np.ctypeslib.as_array(buf_ptr.contents)
                     img16 = arr.reshape(fr.height, row_words)
                     img16 = img16[:, :fr.width]
-                    img8 = (img16 / 256).astype("uint8")
+                    img8 = _stretch_preview(img16)
 
                     return img8, img16, idx, fr
 
@@ -791,7 +843,7 @@ def main():
             img16 = img16[:, :fr.width]
 
             # convert 16-bit -> 8-bit for display
-            img8 = (img16 / 256).astype("uint8")
+            img8 = _stretch_preview(img16)
 
             # show in a window
             cv2.imshow("Hamamatsu Live", img8)

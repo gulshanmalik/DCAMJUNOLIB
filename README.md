@@ -1,2 +1,0 @@
-# DCAMJUNOLIB
-library for DCAM

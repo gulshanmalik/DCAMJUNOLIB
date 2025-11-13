@@ -17,7 +17,7 @@ try:
 except Exception:
     import filters as img_filters
 
-import gi
+import g
 
 gi.require_version('Gtk', '3.0')
 from gi.repository import Gtk, Gdk, GdkPixbuf, GLib, GObject  # noqa: E402
@@ -476,7 +476,7 @@ class HistogramWidget(Gtk.DrawingArea):
 
 class CameraWindow(Gtk.Window):
     def __init__(self, camera: CameraDevice):
-        super().__init__(title='Hamamatsu Camera - GTK')
+        super().__init__(title='JUNO - Icp Control')
         self.camera = camera
         self.set_default_size(900, 700)
         self.connect('destroy', self.on_destroy)
@@ -543,15 +543,16 @@ class CameraWindow(Gtk.Window):
 
         # Right panel: Settings + Filters + Display sections
         right_panel = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
-        right_panel.set_size_request(320, -1)
+        right_panel.set_size_request(360, -1)
         content.pack_start(right_panel, False, False, 0)
 
-        settings_frame = Gtk.Frame(label='Settings')
-        settings_frame.set_vexpand(True)
-        right_panel.pack_start(settings_frame, True, True, 0)
+        tabs = Gtk.Notebook()
+        tabs.set_tab_pos(Gtk.PositionType.TOP)
+        right_panel.pack_start(tabs, True, True, 0)
+
         settings_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
-        settings_box.set_border_width(6)
-        settings_frame.add(settings_box)
+        settings_box.set_border_width(8)
+        tabs.append_page(settings_box, Gtk.Label(label='Settings'))
 
         button_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
         settings_box.pack_start(button_row, False, False, 0)
@@ -635,11 +636,9 @@ class CameraWindow(Gtk.Window):
         roi_grid.attach(lbl_duration, 0, 8, 1, 1)
         roi_grid.attach(self.spin_save_secs, 1, 8, 1, 1)
 
-        filters_frame = Gtk.Frame(label='Filters')
-        right_panel.pack_start(filters_frame, False, False, 0)
         filters_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
-        filters_box.set_border_width(6)
-        filters_frame.add(filters_box)
+        filters_box.set_border_width(8)
+        tabs.append_page(filters_box, Gtk.Label(label='Filters'))
         self.chk_filter_smooth = Gtk.CheckButton(label='Smooth preview (Gaussian)')
         self.chk_filter_smooth.connect('toggled', self.on_filter_smooth_toggled)
         filters_box.pack_start(self.chk_filter_smooth, False, False, 0)
@@ -649,12 +648,26 @@ class CameraWindow(Gtk.Window):
         self.chk_filter_mavg = Gtk.CheckButton(label='Moving average (5 frames)')
         self.chk_filter_mavg.connect('toggled', self.on_filter_mavg_toggled)
         filters_box.pack_start(self.chk_filter_mavg, False, False, 0)
+        self.chk_filter_mavg_sub = Gtk.CheckButton(label='Rolling avg diff')
+        self.chk_filter_mavg_sub.connect('toggled', self.on_filter_mavg_sub_toggled)
+        filters_box.pack_start(self.chk_filter_mavg_sub, False, False, 0)
 
-        display_frame = Gtk.Frame(label='Display Settings')
-        right_panel.pack_start(display_frame, False, False, 0)
+        sub_params = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        filters_box.pack_start(sub_params, False, False, 0)
+        sub_params.pack_start(Gtk.Label(label='Length'), False, False, 0)
+        self.spin_mavg_length = Gtk.SpinButton.new_with_range(2, 200, 1)
+        self.spin_mavg_length.set_value(20)
+        sub_params.pack_start(self.spin_mavg_length, False, False, 0)
+        self.spin_mavg_length.connect('value-changed', self.on_filter_mavg_sub_params_changed)
+        sub_params.pack_start(Gtk.Label(label='Normalize'), False, False, 0)
+        self.chk_mavg_sub_norm = Gtk.CheckButton()
+        self.chk_mavg_sub_norm.set_active(True)
+        self.chk_mavg_sub_norm.connect('toggled', self.on_filter_mavg_sub_norm_toggled)
+        sub_params.pack_start(self.chk_mavg_sub_norm, False, False, 0)
+
         display_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
-        display_box.set_border_width(6)
-        display_frame.add(display_box)
+        display_box.set_border_width(8)
+        tabs.append_page(display_box, Gtk.Label(label='Display'))
         self.chk_show_fps = Gtk.CheckButton(label='Show FPS label')
         self.chk_show_fps.set_active(True)
         self.chk_show_fps.connect('toggled', self.on_display_show_fps_toggled)
@@ -698,6 +711,8 @@ class CameraWindow(Gtk.Window):
         self.filter_sharpen = False
         self.filter_mavg = img_filters.MovingAverageFilter(window=5)
         self.filter_mavg_enabled = False
+        self.filter_mavg_sub = img_filters.RollingMovingAverageDiff(length=10)
+        self.filter_mavg_sub_enabled = False
         self.preview_keep_aspect = True
         self.show_fps_overlay = True
         self.fps_label.set_visible(self.show_fps_overlay)
@@ -839,6 +854,20 @@ class CameraWindow(Gtk.Window):
             display_rgb = img_filters.sharpen(display_rgb)
         if self.filter_mavg_enabled:
             display_rgb = self.filter_mavg.apply(display_rgb)
+        if self.filter_mavg_sub_enabled:
+            diff = self.filter_mavg_sub.apply(display_rgb)
+            if diff is not None:
+                avg = self.filter_mavg.apply(display_rgb)
+                if avg is None:
+                    avg = display_rgb
+                blended = cv2.addWeighted(
+                    avg.astype(np.float32),
+                    0.7,
+                    diff.astype(np.float32),
+                    0.3,
+                    0.0
+                )
+                display_rgb = np.clip(blended, 0, 255).astype(np.uint8)
         display_rgb = np.clip(display_rgb, 0, 255).astype(np.uint8, copy=False)
         self.last_rgb = display_rgb
         self.last_16 = img16
@@ -925,6 +954,18 @@ class CameraWindow(Gtk.Window):
     def on_display_keep_aspect_toggled(self, button):
         self.preview_keep_aspect = bool(button.get_active())
         self.preview_area.queue_draw()
+
+    def on_filter_mavg_sub_toggled(self, button):
+        self.filter_mavg_sub_enabled = bool(button.get_active())
+        if not self.filter_mavg_sub_enabled:
+            self.filter_mavg_sub.reset()
+
+    def on_filter_mavg_sub_params_changed(self, _spin):
+        length = int(self.spin_mavg_length.get_value())
+        self.filter_mavg_sub.set_params(length=length)
+
+    def on_filter_mavg_sub_norm_toggled(self, button):
+        self.filter_mavg_sub.set_params(normalize=bool(button.get_active()))
 
     def on_black_level_changed(self, spin):
         if self._block_black_spin:
