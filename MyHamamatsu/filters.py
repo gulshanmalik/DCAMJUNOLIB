@@ -1,3 +1,8 @@
+#***************************************
+#created on 2024-06-15
+#by Gulshan Malik
+#***************************************
+
 """Image filter helpers used by GTK GUI variants."""
 
 from __future__ import annotations
@@ -101,4 +106,6 @@ class RollingMovingAverageDiff:
             if max_val > 0:
                 diff = (diff / max_val) * 255.0
         return diff.astype(np.uint8)
+    
+# EOF
 

@@ -1,4 +1,10 @@
 #!/usr/bin/env python3
+
+#*******************************
+#created on 2024-06-15  
+#by Gulshan Malik
+#***************************************
+
 """GTK3 GUI for the Hamamatsu camera with a right-side control panel."""
 
 import sys
