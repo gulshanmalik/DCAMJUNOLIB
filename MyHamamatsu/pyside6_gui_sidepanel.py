@@ -1,50 +1,45 @@
 #!/usr/bin/env python3
+"""PySide6 GUI that mirrors the GTK side-panel interface for Hamamatsu cameras."""
 
-#*******************************
-#created on 2024-06-15  
-#by Gulshan Malik
-#***************************************
+from __future__ import annotations
 
-"""GTK3 GUI for the Hamamatsu camera with a right-side control panel."""
-
-import sys
-import os
-import threading
-from datetime import datetime
 import json
 import math
+import os
+import sys
+import threading
 import time
+from datetime import datetime
+from typing import Optional
 
-import numpy as np
+
 import cv2
+import numpy as np
+from PySide6 import QtCore, QtGui, QtWidgets
 
 try:
     from . import filters as img_filters
-except Exception:
-    import filters as img_filters
-
-import gi
-
-gi.require_version('Gtk', '3.0')
-from gi.repository import Gtk, Gdk, GdkPixbuf, GLib, GObject  # noqa: E402
-import cairo  # noqa: E402
+except Exception:  # pragma: no cover
+    import filters as img_filters  # type: ignore
 
 try:
     from camera import CameraDevice
-except Exception:  # pragma: no cover - fallback for package use
+except Exception:  # pragma: no cover
     from .camera import CameraDevice
 
 
-class FrameWorker:
-    """Background thread that fetches frames and posts them back to the GTK loop."""
+class FrameWorker(QtCore.QObject):
+    """Background thread that fetches camera frames and emits them via a Qt signal."""
 
-    def __init__(self, camera: CameraDevice, callback):
+    frameReady = QtCore.Signal(object, object, object)  # (img_rgb, img16, histogram)
+
+    def __init__(self, camera: CameraDevice, parent: Optional[QtCore.QObject] = None):
+        super().__init__(parent)
         self.camera = camera
-        self._callback = callback
         self._running = False
         self._preview_interval = 1.0 / 15.0
         self._last_emit = 0.0
-        self._thread = None
+        self._thread: Optional[threading.Thread] = None
         self._display_min = 0
         self._display_max = 65535
         self._levels_lock = threading.Lock()
@@ -97,13 +92,13 @@ class FrameWorker:
                 try:
                     self.camera.hard_reset()
                 except Exception:
-                    self._emit(None, None, None)
+                    self.frameReady.emit(None, None, None)
                     time.sleep(0.5)
                     continue
                 try:
                     res = self.camera.get_frame(timeout_ms=2000)
                 except Exception:
-                    self._emit(None, None, None)
+                    self.frameReady.emit(None, None, None)
                     time.sleep(0.5)
                     continue
 
@@ -120,36 +115,28 @@ class FrameWorker:
                 hist = np.histogram(img16, bins=256, range=(0, 65535))[0]
             display = self._apply_levels(img16)
             if display is None:
-                self._emit(None, None, hist)
+                self.frameReady.emit(None, None, hist)
                 continue
             img_rgb = cv2.cvtColor(display, cv2.COLOR_GRAY2RGB)
-            self._emit(img_rgb, img16, hist)
-
-    def _emit(self, img_rgb, img16, hist):
-        if not self._callback:
-            return
-
-        def _dispatch():
-            self._callback(img_rgb, img16, hist)
-            return False
-
-        GLib.idle_add(_dispatch, priority=GLib.PRIORITY_DEFAULT)
+            self.frameReady.emit(img_rgb, img16, hist)
 
 
-class SaveWorker:
-    """Background worker that writes raw frames to disk along with metadata."""
+class SaveWorker(QtCore.QObject):
+    """Background worker that records raw frames to disk and emits progress."""
+
+    progress = QtCore.Signal(int, float)  # frames saved, elapsed seconds
+    finished = QtCore.Signal(bool, str, int)  # success, error message, frames saved
 
     def __init__(self, camera: CameraDevice, path: str, frame_limit: int, duration_limit: float,
-                 progress_cb=None, finished_cb=None):
+                 parent: Optional[QtCore.QObject] = None):
+        super().__init__(parent)
         self.camera = camera
         self.path = path
         self.frame_limit = int(frame_limit)
         self.duration_limit = float(duration_limit)
         self._abort = False
         self.metadata_path = self._derive_metadata_path(path)
-        self._progress_cb = progress_cb
-        self._finished_cb = finished_cb
-        self._thread = None
+        self._thread: Optional[threading.Thread] = None
 
     @staticmethod
     def _derive_metadata_path(bin_path: str) -> str:
@@ -174,12 +161,12 @@ class SaveWorker:
         }
         try:
             meta['camera_status'] = self.camera.dump_status()
-        except Exception as e:
-            meta['camera_status_error'] = str(e)
+        except Exception as exc:
+            meta['camera_status_error'] = str(exc)
         try:
             meta['roi'] = self.camera.get_subarray_info()
-        except Exception as e:
-            meta['roi_error'] = str(e)
+        except Exception as exc:
+            meta['roi_error'] = str(exc)
         return meta
 
     @staticmethod
@@ -212,8 +199,8 @@ class SaveWorker:
         try:
             with open(self.metadata_path, 'w', encoding='utf-8') as meta_file:
                 json.dump(finalized, meta_file, indent=2, sort_keys=True)
-        except Exception as e:
-            print(f'Warning: failed to write metadata file {self.metadata_path}: {e}', file=sys.stderr)
+        except Exception as exc:
+            print(f'Warning: failed to write metadata file {self.metadata_path}: {exc}', file=sys.stderr)
 
     def start(self):
         if self._thread and self._thread.is_alive():
@@ -224,18 +211,6 @@ class SaveWorker:
 
     def request_stop(self):
         self._abort = True
-
-    def _emit_progress(self, frames_saved: int, elapsed: float):
-        if not self._progress_cb:
-            return False
-        self._progress_cb(frames_saved, elapsed)
-        return False
-
-    def _emit_finished(self, success: bool, error: str, frames_saved: int):
-        if not self._finished_cb:
-            return False
-        self._finished_cb(success, error, frames_saved)
-        return False
 
     def _run(self):
         saved = 0
@@ -263,13 +238,12 @@ class SaveWorker:
                         metadata.update(self._metadata_from_frame(arr))
                     f.write(arr.astype('<u2').tobytes())
                     saved += 1
-                    GLib.idle_add(self._emit_progress, saved, time.time() - start_time,
-                                  priority=GLib.PRIORITY_DEFAULT)
+                    self.progress.emit(saved, time.time() - start_time)
             if self._abort and stop_reason == 'completed':
                 stop_reason = 'user_abort'
             success = True
-        except Exception as e:
-            error_message = str(e) or 'Unknown error'
+        except Exception as exc:
+            error_message = str(exc) or 'Unknown error'
             metadata['error'] = error_message
             stop_reason = 'error'
         finally:
@@ -285,35 +259,28 @@ class SaveWorker:
             except Exception:
                 pass
 
-        GLib.idle_add(self._emit_finished, success, error_message, saved, priority=GLib.PRIORITY_DEFAULT)
+        self.finished.emit(success, error_message, saved)
 
 
-class HistogramWidget(Gtk.DrawingArea):
-    """Vertical histogram with integrated draggable range handles."""
+class HistogramWidget(QtWidgets.QWidget):
+    """Vertical histogram widget with draggable low/high level handles."""
 
-    __gsignals__ = {
-        'levels-changed': (GObject.SIGNAL_RUN_FIRST, None, (int, int)),
-    }
+    levelsChanged = QtCore.Signal(int, int)
 
-    def __init__(self, bins: int = 256):
-        super().__init__()
+    def __init__(self, parent: Optional[QtWidgets.QWidget] = None, bins: int = 256):
+        super().__init__(parent)
         self._bins = int(bins)
         self._hist = np.zeros(self._bins, dtype=np.int64)
         self._min_level = 0
         self._max_level = 65535
         self._view_low = 0
         self._view_high = 65535
-        self._active_handle = None
-        self.set_size_request(-1, 160)
-        self.add_events(
-            Gdk.EventMask.BUTTON_PRESS_MASK |
-            Gdk.EventMask.BUTTON_RELEASE_MASK |
-            Gdk.EventMask.POINTER_MOTION_MASK
-        )
-        self.connect('draw', self._on_draw)
-        self.connect('button-press-event', self._on_button_press)
-        self.connect('button-release-event', self._on_button_release)
-        self.connect('motion-notify-event', self._on_motion)
+        self._active_handle: Optional[str] = None
+        self.setMinimumWidth(160)
+        self.setMinimumHeight(200)
+
+    def sizeHint(self):  # noqa: D401
+        return QtCore.QSize(180, 220)
 
     def set_histogram(self, hist):
         if hist is None:
@@ -324,7 +291,7 @@ class HistogramWidget(Gtk.DrawingArea):
                 arr = np.resize(arr, self._bins)
             self._hist = arr.astype(np.int64, copy=False)
         self._auto_zoom_view()
-        self.queue_draw()
+        self.update()
 
     def set_level_range(self, low: int, high: int, emit_signal: bool = False):
         low = max(0, min(int(low), 65535))
@@ -334,31 +301,27 @@ class HistogramWidget(Gtk.DrawingArea):
         self._min_level = low
         self._max_level = high
         self._ensure_view_contains_levels()
-        self.queue_draw()
+        self.update()
         if emit_signal:
-            self.emit('levels-changed', self._min_level, self._max_level)
+            self.levelsChanged.emit(self._min_level, self._max_level)
 
-    def _hist_rect(self):
-        alloc = self.get_allocation()
-        margin_x = 12
-        margin_y = 10
-        width = max(1, alloc.width - 2 * margin_x)
-        height = max(1, alloc.height - 2 * margin_y)
-        return margin_x, margin_y, width, height
+    def _hist_rect(self) -> QtCore.QRectF:
+        rect = self.rect().adjusted(12, 10, -12, -12)
+        if rect.width() <= 0 or rect.height() <= 0:
+            rect = QtCore.QRectF(rect.left(), rect.top(), max(1, rect.width()), max(1, rect.height()))
+        return rect
 
-    def _level_to_y(self, level: int, rect):
+    def _level_to_y(self, level: int, rect: QtCore.QRectF) -> float:
         level = max(0, min(65535, int(level)))
         span = max(1, self._view_high - self._view_low)
         t = (level - self._view_low) / span
         t = max(0.0, min(1.0, t))
-        x, y, _, height = rect
-        return y + height - t * height
+        return rect.top() + rect.height() - t * rect.height()
 
-    def _y_to_level(self, ypos: float, rect):
-        x, y, _, height = rect
-        if height <= 0:
+    def _y_to_level(self, ypos: float, rect: QtCore.QRectF) -> int:
+        if rect.height() <= 0:
             return 0
-        t = (y + height - ypos) / height
+        t = (rect.top() + rect.height() - ypos) / rect.height()
         t = max(0.0, min(1.0, t))
         level = self._view_low + t * (self._view_high - self._view_low)
         return int(round(max(0, min(65535, level))))
@@ -397,22 +360,18 @@ class HistogramWidget(Gtk.DrawingArea):
         if changed and self._view_high <= self._view_low:
             self._view_high = min(65535, self._view_low + 1)
 
-    def _on_draw(self, _widget, cr: cairo.Context):
-        alloc = self.get_allocation()
-        cr.set_source_rgb(0.12, 0.12, 0.12)
-        cr.rectangle(0, 0, alloc.width, alloc.height)
-        cr.fill()
+    def paintEvent(self, _event: QtGui.QPaintEvent):
+        painter = QtGui.QPainter(self)
+        painter.fillRect(self.rect(), QtGui.QColor(30, 30, 30))
 
         rect = self._hist_rect()
-        rx, ry, rw, rh = rect
-        cr.set_source_rgb(0.18, 0.18, 0.18)
-        cr.rectangle(rx, ry, rw, rh)
-        cr.fill()
+        painter.fillRect(rect, QtGui.QColor(40, 40, 40))
 
         max_count = int(self._hist.max()) if self._hist.size else 0
         max_count = max(1, max_count)
         bin_width_level = 65535 / max(1, self._bins)
-        cr.set_source_rgba(0.47, 0.71, 1.0, 0.8)
+        painter.setPen(QtCore.Qt.NoPen)
+        painter.setBrush(QtGui.QColor(120, 180, 255, 210))
 
         for i in range(self._bins):
             count = self._hist[i]
@@ -426,291 +385,366 @@ class HistogramWidget(Gtk.DrawingArea):
             y_low = self._level_to_y(bin_high, rect)
             y_top = min(y_high, y_low)
             bar_height = abs(y_high - y_low)
-            bar_width = rw * (count / max_count)
-            cr.rectangle(rx, y_top, bar_width, bar_height)
-        cr.fill()
+            bar_width = rect.width() * (count / max_count)
+            painter.drawRect(QtCore.QRectF(rect.left(), y_top, bar_width, bar_height))
 
-        cr.set_source_rgb(1.0, 0.78, 0.0)
-        cr.set_line_width(2)
+        handle_pen = QtGui.QPen(QtGui.QColor(255, 200, 0), 2)
+        painter.setPen(handle_pen)
+        painter.setBrush(QtGui.QColor(255, 200, 0))
         for level in (self._min_level, self._max_level):
             y_pos = self._level_to_y(level, rect)
-            cr.move_to(rx, y_pos)
-            cr.line_to(rx + rw, y_pos)
-            cr.stroke()
-            cr.rectangle(rx + rw - 12, y_pos - 4, 12, 8)
-            cr.fill()
+            painter.drawLine(QtCore.QPointF(rect.left(), y_pos), QtCore.QPointF(rect.right(), y_pos))
+            handle_rect = QtCore.QRectF(rect.right() - 12, y_pos - 4, 12, 8)
+            painter.drawRect(handle_rect)
 
-        cr.set_source_rgb(0.78, 0.78, 0.78)
-        cr.set_font_size(10)
-        cr.move_to(rx + 4, ry + 12)
-        cr.show_text(f"{self._view_high}")
-        cr.move_to(rx + 4, ry + rh - 4)
-        cr.show_text(f"{self._view_low}")
-        return False
+        painter.setPen(QtGui.QColor(200, 200, 200))
+        font = painter.font()
+        font.setPointSize(9)
+        painter.setFont(font)
+        painter.drawText(QtCore.QPointF(rect.left() + 4, rect.top() + 12), f"{self._view_high}")
+        painter.drawText(QtCore.QPointF(rect.left() + 4, rect.bottom() - 4), f"{self._view_low}")
 
-    def _on_button_press(self, _widget, event):
-        if event.button != 1:
-            return False
+    def mousePressEvent(self, event: QtGui.QMouseEvent):
+        if event.button() != QtCore.Qt.LeftButton:
+            return
         rect = self._hist_rect()
-        x, y, w, h = rect
-        if not (x <= event.x <= x + w and y <= event.y <= y + h):
-            return False
+        if not rect.contains(event.pos()):
+            return
         y_min = self._level_to_y(self._min_level, rect)
         y_max = self._level_to_y(self._max_level, rect)
-        self._active_handle = 'min' if abs(event.y - y_min) <= abs(event.y - y_max) else 'max'
-        self._update_handle_from_pos(event.y, rect)
-        return True
+        self._active_handle = 'min' if abs(event.y() - y_min) <= abs(event.y() - y_max) else 'max'
+        self._update_handle_from_pos(event.y(), rect)
 
-    def _on_motion(self, _widget, event):
+    def mouseMoveEvent(self, event: QtGui.QMouseEvent):
         if not self._active_handle:
-            return False
+            return
         rect = self._hist_rect()
-        self._update_handle_from_pos(event.y, rect)
-        return True
+        self._update_handle_from_pos(event.y(), rect)
 
-    def _on_button_release(self, _widget, event):
-        if event.button == 1:
+    def mouseReleaseEvent(self, event: QtGui.QMouseEvent):
+        if event.button() == QtCore.Qt.LeftButton:
             self._active_handle = None
-        return False
 
-    def _update_handle_from_pos(self, ypos: float, rect):
+    def _update_handle_from_pos(self, ypos: float, rect: QtCore.QRectF):
         level = self._y_to_level(ypos, rect)
         if self._active_handle == 'min':
             self.set_level_range(level, self._max_level, emit_signal=True)
         elif self._active_handle == 'max':
             self.set_level_range(self._min_level, level, emit_signal=True)
 
-class CameraWindow(Gtk.Window):
+
+class PreviewArea(QtWidgets.QWidget):
+    """Widget that paints the latest QPixmap, optionally preserving aspect ratio."""
+
+    def __init__(self, parent: Optional[QtWidgets.QWidget] = None):
+        super().__init__(parent)
+        self._pixmap: Optional[QtGui.QPixmap] = None
+        self._keep_aspect = True
+        self.setMinimumSize(640, 480)
+        self.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Expanding)
+
+    def set_pixmap(self, pixmap: Optional[QtGui.QPixmap]):
+        self._pixmap = pixmap
+        self.update()
+
+    def set_keep_aspect(self, keep: bool):
+        self._keep_aspect = bool(keep)
+        self.update()
+
+    def paintEvent(self, _event: QtGui.QPaintEvent):
+        painter = QtGui.QPainter(self)
+        painter.fillRect(self.rect(), QtCore.Qt.black)
+        if not self._pixmap or self._pixmap.isNull():
+            return
+        target = self.rect()
+        if self._keep_aspect:
+            scaled = self._pixmap.scaled(target.size(), QtCore.Qt.KeepAspectRatio, QtCore.Qt.SmoothTransformation)
+            x = target.x() + (target.width() - scaled.width()) // 2
+            y = target.y() + (target.height() - scaled.height()) // 2
+            painter.drawPixmap(x, y, scaled)
+        else:
+            scaled = self._pixmap.scaled(target.size(), QtCore.Qt.IgnoreAspectRatio, QtCore.Qt.SmoothTransformation)
+            painter.drawPixmap(target.topLeft(), scaled)
+
+
+class CameraWindow(QtWidgets.QMainWindow):
+    """Main window that mirrors the GTK side-panel layout using PySide6 widgets."""
+
     def __init__(self, camera: CameraDevice):
-        super().__init__(title='JUNO - Icp Control')
+        super().__init__()
         self.camera = camera
-        self.set_default_size(900, 700)
-        self.connect('destroy', self.on_destroy)
+        self.setWindowTitle('JUNO - Icp Control')
+        self.resize(1200, 760)
 
-        root = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
-        root.set_border_width(8)
-        self.add(root)
+        central = QtWidgets.QWidget()
+        self.setCentralWidget(central)
+        root_layout = QtWidgets.QVBoxLayout(central)
+        root_layout.setContentsMargins(8, 8, 8, 8)
+        root_layout.setSpacing(8)
 
-        content = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
-        root.pack_start(content, True, True, 0)
+        content_layout = QtWidgets.QHBoxLayout()
+        content_layout.setSpacing(8)
+        root_layout.addLayout(content_layout, stretch=1)
 
-        # Histogram column (left side of preview)
-        hist_column = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
-        hist_column.set_border_width(4)
-        hist_column.set_size_request(190, -1)
-        content.pack_start(hist_column, False, False, 0)
+        # Histogram column
+        hist_container = QtWidgets.QFrame()
+        hist_container.setMinimumWidth(210)
+        hist_layout = QtWidgets.QVBoxLayout(hist_container)
+        hist_layout.setContentsMargins(4, 4, 4, 4)
+        hist_layout.setSpacing(6)
 
-        hist_frame = Gtk.Frame(label='Histogram / Display Range')
-        hist_frame.set_vexpand(True)
-        hist_column.pack_start(hist_frame, True, True, 0)
-        hist_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
-        hist_box.set_border_width(6)
-        hist_frame.add(hist_box)
+        hist_group = QtWidgets.QGroupBox('Histogram / Display Range')
+        hist_group_layout = QtWidgets.QVBoxLayout(hist_group)
+        hist_group_layout.setContentsMargins(6, 6, 6, 6)
+        hist_group_layout.setSpacing(6)
 
-        self.auto_levels_check = Gtk.CheckButton(label='Auto display range')
-        self.auto_levels_check.set_active(True)
-        self.auto_levels_check.connect('toggled', self.on_auto_levels_toggled)
-        hist_box.pack_start(self.auto_levels_check, False, False, 0)
+        self.auto_levels_check = QtWidgets.QCheckBox('Auto display range')
+        self.auto_levels_check.setChecked(True)
+        self.auto_levels_check.toggled.connect(self.on_auto_levels_toggled)
+        hist_group_layout.addWidget(self.auto_levels_check)
 
         self.hist_widget = HistogramWidget()
-        self.hist_widget.set_vexpand(True)
-        self.hist_widget.connect('levels-changed', self.on_hist_levels_changed)
-        hist_box.pack_start(self.hist_widget, True, True, 0)
+        self.hist_widget.levelsChanged.connect(self.on_hist_levels_changed)
+        hist_group_layout.addWidget(self.hist_widget, stretch=1)
 
-        levels_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
-        hist_box.pack_start(levels_box, False, False, 0)
+        levels_box = QtWidgets.QWidget()
+        levels_layout = QtWidgets.QVBoxLayout(levels_box)
+        levels_layout.setContentsMargins(0, 0, 0, 0)
+        levels_layout.setSpacing(6)
 
-        black_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
-        levels_box.pack_start(black_row, False, False, 0)
-        black_row.pack_start(Gtk.Label(label='Black'), False, False, 0)
-        self.spin_black = Gtk.SpinButton.new_with_range(0, 65534, 1)
-        self.spin_black.connect('value-changed', self.on_black_level_changed)
-        black_row.pack_start(self.spin_black, True, True, 0)
+        black_row = QtWidgets.QHBoxLayout()
+        black_label = QtWidgets.QLabel('Black')
+        self.spin_black = QtWidgets.QSpinBox()
+        self.spin_black.setRange(0, 65534)
+        self.spin_black.valueChanged.connect(self.on_black_level_changed)
+        black_row.addWidget(black_label)
+        black_row.addWidget(self.spin_black, stretch=1)
+        levels_layout.addLayout(black_row)
 
-        white_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
-        levels_box.pack_start(white_row, False, False, 0)
-        white_row.pack_start(Gtk.Label(label='White'), False, False, 0)
-        self.spin_white = Gtk.SpinButton.new_with_range(1, 65535, 1)
-        self.spin_white.connect('value-changed', self.on_white_level_changed)
-        white_row.pack_start(self.spin_white, True, True, 0)
+        white_row = QtWidgets.QHBoxLayout()
+        white_label = QtWidgets.QLabel('White')
+        self.spin_white = QtWidgets.QSpinBox()
+        self.spin_white.setRange(1, 65535)
+        self.spin_white.valueChanged.connect(self.on_white_level_changed)
+        white_row.addWidget(white_label)
+        white_row.addWidget(self.spin_white, stretch=1)
+        levels_layout.addLayout(white_row)
 
-        # Center panel: preview + fps
-        left_panel = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
-        content.pack_start(left_panel, True, True, 0)
+        hist_group_layout.addWidget(levels_box)
+        hist_layout.addWidget(hist_group, stretch=1)
+        content_layout.addWidget(hist_container, stretch=0)
 
-        self.preview_area = Gtk.DrawingArea()
-        self.preview_area.set_size_request(640, 480)
-        self.preview_area.connect('draw', self._on_preview_draw)
-        left_panel.pack_start(self.preview_area, True, True, 0)
+        # Center preview panel
+        center_widget = QtWidgets.QWidget()
+        center_layout = QtWidgets.QVBoxLayout(center_widget)
+        center_layout.setContentsMargins(0, 0, 0, 0)
+        center_layout.setSpacing(6)
 
-        self.fps_label = Gtk.Label(label='FPS: --')
-        self.fps_label.set_justify(Gtk.Justification.CENTER)
-        left_panel.pack_start(self.fps_label, False, False, 0)
+        self.preview_area = PreviewArea()
+        center_layout.addWidget(self.preview_area, stretch=1)
 
-        # Right panel: Settings + Filters + Display sections
-        right_panel = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
-        right_panel.set_size_request(360, -1)
-        content.pack_start(right_panel, False, False, 0)
+        self.fps_label = QtWidgets.QLabel('FPS: --')
+        self.fps_label.setAlignment(QtCore.Qt.AlignCenter)
+        center_layout.addWidget(self.fps_label)
+        content_layout.addWidget(center_widget, stretch=1)
 
-        tabs = Gtk.Notebook()
-        tabs.set_tab_pos(Gtk.PositionType.TOP)
-        right_panel.pack_start(tabs, True, True, 0)
+        # Right panel with tabs
+        right_panel = QtWidgets.QFrame()
+        right_panel.setMinimumWidth(380)
+        right_layout = QtWidgets.QVBoxLayout(right_panel)
+        right_layout.setContentsMargins(4, 4, 4, 4)
+        right_layout.setSpacing(6)
 
-        settings_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
-        settings_box.set_border_width(8)
-        tabs.append_page(settings_box, Gtk.Label(label='Settings'))
+        tabs = QtWidgets.QTabWidget()
+        right_layout.addWidget(tabs, stretch=1)
 
-        button_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
-        settings_box.pack_start(button_row, False, False, 0)
+        # Settings tab
+        settings_widget = QtWidgets.QWidget()
+        settings_layout = QtWidgets.QVBoxLayout(settings_widget)
+        settings_layout.setSpacing(10)
+        settings_layout.setContentsMargins(8, 8, 8, 8)
+        tabs.addTab(settings_widget, 'Settings')
 
-        self.btn_start = Gtk.Button(label='Start')
-        self.btn_start.connect('clicked', self.on_start_stop)
-        button_row.pack_start(self.btn_start, True, True, 0)
+        button_row = QtWidgets.QHBoxLayout()
+        self.btn_start = QtWidgets.QPushButton('Start')
+        self.btn_start.clicked.connect(self.on_start_stop)
+        self.btn_capture = QtWidgets.QPushButton('Save Burst')
+        self.btn_capture.clicked.connect(self.on_save_burst)
+        button_row.addWidget(self.btn_start)
+        button_row.addWidget(self.btn_capture)
+        settings_layout.addLayout(button_row)
 
-        self.btn_capture = Gtk.Button(label='Save Burst')
-        self.btn_capture.connect('clicked', self.on_save_burst)
-        button_row.pack_start(self.btn_capture, True, True, 0)
-
-        exposure_frame = Gtk.Frame(label='Exposure')
-        settings_box.pack_start(exposure_frame, False, False, 0)
-        exp_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
-        exp_box.set_border_width(6)
-        exposure_frame.add(exp_box)
+        exposure_group = QtWidgets.QGroupBox('Exposure')
+        exp_layout = QtWidgets.QVBoxLayout(exposure_group)
+        exp_layout.setSpacing(6)
+        exp_layout.setContentsMargins(6, 6, 6, 6)
+        settings_layout.addWidget(exposure_group)
 
         self.SMAX = 1000
-        self.exp_adjustment = Gtk.Adjustment(value=1, lower=0, upper=self.SMAX, step_increment=1, page_increment=10)
-        self.exp_slider = Gtk.Scale(orientation=Gtk.Orientation.HORIZONTAL, adjustment=self.exp_adjustment)
-        self.exp_slider.set_digits(0)
-        self.exp_slider.set_hexpand(True)
-        self.exp_slider.set_value_pos(Gtk.PositionType.RIGHT)
-        self._exp_slider_handler = self.exp_slider.connect('value-changed', self.on_exp_slider_changed)
-        exp_box.pack_start(self.exp_slider, False, False, 0)
+        self.exp_slider = QtWidgets.QSlider(QtCore.Qt.Horizontal)
+        self.exp_slider.setRange(0, self.SMAX)
+        self.exp_slider.valueChanged.connect(self.on_exp_slider_changed)
+        exp_layout.addWidget(self.exp_slider)
 
-        self.exp_entry = Gtk.Entry()
-        self.exp_entry.set_width_chars(8)
-        self.exp_entry.set_text('1')
-        self.exp_entry.connect('activate', self.on_exp_entry_activated)
-        self.exp_entry.connect('focus-out-event', self.on_exp_entry_focus_out)
-        exp_entry_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
-        exp_entry_row.pack_start(Gtk.Label(label='Seconds:'), False, False, 0)
-        exp_entry_row.pack_start(self.exp_entry, False, False, 0)
-        exp_box.pack_start(exp_entry_row, False, False, 0)
+        exp_entry_row = QtWidgets.QHBoxLayout()
+        exp_entry_row.addWidget(QtWidgets.QLabel('Seconds:'))
+        self.exp_entry = QtWidgets.QLineEdit('1')
+        self.exp_entry.setFixedWidth(100)
+        self.exp_entry.returnPressed.connect(self.on_exp_entry_activated)
+        self.exp_entry.editingFinished.connect(self.on_exp_entry_editing_finished)
+        exp_entry_row.addWidget(self.exp_entry)
+        exp_entry_row.addStretch(1)
+        exp_layout.addLayout(exp_entry_row)
 
-        roi_frame = Gtk.Frame(label='ROI / Acquisition')
-        settings_box.pack_start(roi_frame, False, False, 0)
-        roi_grid = Gtk.Grid(column_spacing=6, row_spacing=4, column_homogeneous=False)
-        roi_grid.set_border_width(6)
-        roi_frame.add(roi_grid)
+        roi_group = QtWidgets.QGroupBox('ROI / Acquisition')
+        roi_layout = QtWidgets.QGridLayout(roi_group)
+        roi_layout.setHorizontalSpacing(8)
+        roi_layout.setVerticalSpacing(4)
+        settings_layout.addWidget(roi_group)
 
-        def grid_spin(label, lower, upper, step, row, digits=0):
-            lbl = Gtk.Label(label=label)
-            lbl.set_xalign(0)
-            roi_grid.attach(lbl, 0, row, 1, 1)
-            widget = Gtk.SpinButton.new_with_range(lower, upper, step)
-            widget.set_digits(digits)
-            widget.set_hexpand(True)
-            roi_grid.attach(widget, 1, row, 1, 1)
-            return widget
+        self.spin_hpos = QtWidgets.QSpinBox()
+        self.spin_hpos.setRange(0, 16384)
+        roi_layout.addWidget(QtWidgets.QLabel('HPOS'), 0, 0)
+        roi_layout.addWidget(self.spin_hpos, 0, 1)
 
-        self.spin_hpos = grid_spin('HPOS', 0, 16384, 1, 0)
-        self.spin_vpos = grid_spin('VPOS', 0, 16384, 1, 1)
-        self.spin_hsize = grid_spin('HSIZE', 2, 16384, 2, 2)
-        self.spin_vsize = grid_spin('VSIZE', 2, 16384, 2, 3)
+        self.spin_vpos = QtWidgets.QSpinBox()
+        self.spin_vpos.setRange(0, 16384)
+        roi_layout.addWidget(QtWidgets.QLabel('VPOS'), 1, 0)
+        roi_layout.addWidget(self.spin_vpos, 1, 1)
 
-        self.btn_maximize_roi = Gtk.Button(label='Maximize')
-        self.btn_maximize_roi.set_tooltip_text('Reset ROI to full sensor resolution')
-        self.btn_maximize_roi.connect('clicked', self.on_maximize_roi)
-        roi_grid.attach(self.btn_maximize_roi, 0, 4, 2, 1)
+        self.spin_hsize = QtWidgets.QSpinBox()
+        self.spin_hsize.setRange(2, 16384)
+        self.spin_hsize.setSingleStep(2)
+        roi_layout.addWidget(QtWidgets.QLabel('HSIZE'), 2, 0)
+        roi_layout.addWidget(self.spin_hsize, 2, 1)
 
-        self.btn_apply_roi = Gtk.Button(label='Apply ROI')
-        self.btn_apply_roi.set_tooltip_text('Apply ROI using CameraDevice.set_subarray()')
-        self.btn_apply_roi.connect('clicked', self.on_apply_roi)
-        roi_grid.attach(self.btn_apply_roi, 0, 5, 2, 1)
+        self.spin_vsize = QtWidgets.QSpinBox()
+        self.spin_vsize.setRange(2, 16384)
+        self.spin_vsize.setSingleStep(2)
+        roi_layout.addWidget(QtWidgets.QLabel('VSIZE'), 3, 0)
+        roi_layout.addWidget(self.spin_vsize, 3, 1)
 
-        self.spin_preview_fps = grid_spin('Preview FPS', 1, 60, 1, 6)
-        self.spin_preview_fps.set_value(15)
-        self.spin_preview_fps.connect('value-changed', self.on_preview_fps_changed)
+        self.btn_maximize_roi = QtWidgets.QPushButton('Maximize')
+        self.btn_maximize_roi.setToolTip('Reset ROI to full sensor resolution')
+        self.btn_maximize_roi.clicked.connect(self.on_maximize_roi)
+        roi_layout.addWidget(self.btn_maximize_roi, 4, 0, 1, 2)
 
-        self.spin_save_frames = grid_spin('Frames to save', 0, 1_000_000, 1, 7)
-        self.spin_save_frames.set_value(1000)
+        self.btn_apply_roi = QtWidgets.QPushButton('Apply ROI')
+        self.btn_apply_roi.setToolTip('Apply ROI using CameraDevice.set_subarray()')
+        self.btn_apply_roi.clicked.connect(self.on_apply_roi)
+        roi_layout.addWidget(self.btn_apply_roi, 5, 0, 1, 2)
 
-        self.spin_save_secs = Gtk.SpinButton.new_with_range(0.0, 3600.0, 0.1)
-        self.spin_save_secs.set_digits(1)
-        self.spin_save_secs.set_value(0.0)
-        lbl_duration = Gtk.Label(label='Duration (s)')
-        lbl_duration.set_xalign(0)
-        roi_grid.attach(lbl_duration, 0, 8, 1, 1)
-        roi_grid.attach(self.spin_save_secs, 1, 8, 1, 1)
+        roi_layout.addWidget(QtWidgets.QLabel('Preview FPS'), 6, 0)
+        self.spin_preview_fps = QtWidgets.QSpinBox()
+        self.spin_preview_fps.setRange(1, 60)
+        self.spin_preview_fps.setValue(15)
+        self.spin_preview_fps.valueChanged.connect(self.on_preview_fps_changed)
+        roi_layout.addWidget(self.spin_preview_fps, 6, 1)
 
-        filters_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
-        filters_box.set_border_width(8)
-        tabs.append_page(filters_box, Gtk.Label(label='Filters'))
-        self.chk_filter_smooth = Gtk.CheckButton(label='Smooth preview (Gaussian)')
-        self.chk_filter_smooth.connect('toggled', self.on_filter_smooth_toggled)
-        filters_box.pack_start(self.chk_filter_smooth, False, False, 0)
-        self.chk_filter_sharpen = Gtk.CheckButton(label='Sharpen preview')
-        self.chk_filter_sharpen.connect('toggled', self.on_filter_sharpen_toggled)
-        filters_box.pack_start(self.chk_filter_sharpen, False, False, 0)
-        self.chk_filter_mavg = Gtk.CheckButton(label='Moving average (5 frames)')
-        self.chk_filter_mavg.connect('toggled', self.on_filter_mavg_toggled)
-        filters_box.pack_start(self.chk_filter_mavg, False, False, 0)
-        self.chk_filter_mavg_sub = Gtk.CheckButton(label='Rolling avg diff')
-        self.chk_filter_mavg_sub.connect('toggled', self.on_filter_mavg_sub_toggled)
-        filters_box.pack_start(self.chk_filter_mavg_sub, False, False, 0)
+        roi_layout.addWidget(QtWidgets.QLabel('Frames to save'), 7, 0)
+        self.spin_save_frames = QtWidgets.QSpinBox()
+        self.spin_save_frames.setRange(0, 1_000_000)
+        self.spin_save_frames.setValue(1000)
+        roi_layout.addWidget(self.spin_save_frames, 7, 1)
 
-        sub_params = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
-        filters_box.pack_start(sub_params, False, False, 0)
-        sub_params.pack_start(Gtk.Label(label='Length'), False, False, 0)
-        self.spin_mavg_length = Gtk.SpinButton.new_with_range(2, 200, 1)
-        self.spin_mavg_length.set_value(20)
-        sub_params.pack_start(self.spin_mavg_length, False, False, 0)
-        self.spin_mavg_length.connect('value-changed', self.on_filter_mavg_sub_params_changed)
-        sub_params.pack_start(Gtk.Label(label='Normalize'), False, False, 0)
-        self.chk_mavg_sub_norm = Gtk.CheckButton()
-        self.chk_mavg_sub_norm.set_active(True)
-        self.chk_mavg_sub_norm.connect('toggled', self.on_filter_mavg_sub_norm_toggled)
-        sub_params.pack_start(self.chk_mavg_sub_norm, False, False, 0)
+        roi_layout.addWidget(QtWidgets.QLabel('Duration (s)'), 8, 0)
+        self.spin_save_secs = QtWidgets.QDoubleSpinBox()
+        self.spin_save_secs.setRange(0.0, 3600.0)
+        self.spin_save_secs.setDecimals(1)
+        self.spin_save_secs.setSingleStep(0.1)
+        roi_layout.addWidget(self.spin_save_secs, 8, 1)
 
-        display_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
-        display_box.set_border_width(8)
-        tabs.append_page(display_box, Gtk.Label(label='Display'))
-        self.chk_show_fps = Gtk.CheckButton(label='Show FPS label')
-        self.chk_show_fps.set_active(True)
-        self.chk_show_fps.connect('toggled', self.on_display_show_fps_toggled)
-        display_box.pack_start(self.chk_show_fps, False, False, 0)
-        self.chk_keep_aspect = Gtk.CheckButton(label='Preserve aspect ratio')
-        self.chk_keep_aspect.set_active(True)
-        self.chk_keep_aspect.connect('toggled', self.on_display_keep_aspect_toggled)
-        display_box.pack_start(self.chk_keep_aspect, False, False, 0)
+        settings_layout.addStretch(1)
+
+        # Filters tab
+        filters_widget = QtWidgets.QWidget()
+        filters_layout = QtWidgets.QVBoxLayout(filters_widget)
+        filters_layout.setSpacing(6)
+        filters_layout.setContentsMargins(8, 8, 8, 8)
+        tabs.addTab(filters_widget, 'Filters')
+
+        self.chk_filter_smooth = QtWidgets.QCheckBox('Smooth preview (Gaussian)')
+        self.chk_filter_smooth.toggled.connect(self.on_filter_smooth_toggled)
+        filters_layout.addWidget(self.chk_filter_smooth)
+
+        self.chk_filter_sharpen = QtWidgets.QCheckBox('Sharpen preview')
+        self.chk_filter_sharpen.toggled.connect(self.on_filter_sharpen_toggled)
+        filters_layout.addWidget(self.chk_filter_sharpen)
+
+        self.chk_filter_mavg = QtWidgets.QCheckBox('Moving average (5 frames)')
+        self.chk_filter_mavg.toggled.connect(self.on_filter_mavg_toggled)
+        filters_layout.addWidget(self.chk_filter_mavg)
+
+        self.chk_filter_mavg_sub = QtWidgets.QCheckBox('Rolling avg diff')
+        self.chk_filter_mavg_sub.toggled.connect(self.on_filter_mavg_sub_toggled)
+        filters_layout.addWidget(self.chk_filter_mavg_sub)
+
+        sub_params_layout = QtWidgets.QHBoxLayout()
+        sub_params_layout.addWidget(QtWidgets.QLabel('Length'))
+        self.spin_mavg_length = QtWidgets.QSpinBox()
+        self.spin_mavg_length.setRange(2, 200)
+        self.spin_mavg_length.setValue(20)
+        self.spin_mavg_length.valueChanged.connect(self.on_filter_mavg_sub_params_changed)
+        sub_params_layout.addWidget(self.spin_mavg_length)
+        sub_params_layout.addWidget(QtWidgets.QLabel('Normalize'))
+        self.chk_mavg_sub_norm = QtWidgets.QCheckBox()
+        self.chk_mavg_sub_norm.setChecked(True)
+        self.chk_mavg_sub_norm.toggled.connect(self.on_filter_mavg_sub_norm_toggled)
+        sub_params_layout.addWidget(self.chk_mavg_sub_norm)
+        sub_params_layout.addStretch(1)
+        filters_layout.addLayout(sub_params_layout)
+        filters_layout.addStretch(1)
+
+        # Display tab
+        display_widget = QtWidgets.QWidget()
+        display_layout = QtWidgets.QVBoxLayout(display_widget)
+        display_layout.setSpacing(6)
+        display_layout.setContentsMargins(8, 8, 8, 8)
+        tabs.addTab(display_widget, 'Display')
+
+        self.chk_show_fps = QtWidgets.QCheckBox('Show FPS label')
+        self.chk_show_fps.setChecked(True)
+        self.chk_show_fps.toggled.connect(self.on_display_show_fps_toggled)
+        display_layout.addWidget(self.chk_show_fps)
+
+        self.chk_keep_aspect = QtWidgets.QCheckBox('Preserve aspect ratio')
+        self.chk_keep_aspect.setChecked(True)
+        self.chk_keep_aspect.toggled.connect(self.on_display_keep_aspect_toggled)
+        display_layout.addWidget(self.chk_keep_aspect)
+        display_layout.addStretch(1)
+
+        content_layout.addWidget(right_panel, stretch=0)
 
         # Status bar
-        self.status = Gtk.Statusbar()
-        self.status_context = self.status.get_context_id('status')
-        root.pack_start(self.status, False, False, 0)
-        self._status_timeout_id = None
+        self.status = self.statusBar()
+        self._status_timer = QtCore.QTimer(self)
+        self._status_timer.setSingleShot(True)
+        self._status_timer.timeout.connect(self._clear_status)
 
-        # Worker + state
-        self.worker = FrameWorker(self.camera, self.on_frame_ready)
+        # Worker + runtime state init
+        self.worker = FrameWorker(self.camera)
+        self.worker.frameReady.connect(self.on_frame_ready)
         self.display_min = 0
         self.display_max = 65535
         self.hist_widget.set_level_range(self.display_min, self.display_max, emit_signal=False)
         self._block_black_spin = False
         self._block_white_spin = False
-        self._set_spin_value(self.spin_black, self.display_min, attr='_block_black_spin')
-        self._set_spin_value(self.spin_white, self.display_max, attr='_block_white_spin')
+        self._set_spin_value(self.spin_black, self.display_min, '_block_black_spin')
+        self._set_spin_value(self.spin_white, self.display_max, '_block_white_spin')
         self.worker.set_display_levels(self.display_min, self.display_max)
-        self.worker.set_preview_fps(self.spin_preview_fps.get_value())
+        self.worker.set_preview_fps(self.spin_preview_fps.value())
 
         self.last_rgb = None
         self.last_16 = None
         self.last_hist = None
-        self._latest_pixbuf = None
+        self._latest_pixmap: Optional[QtGui.QPixmap] = None
+        self._latest_image_bytes = None
         self.running = False
-        self._frame_times = []
-        self.save_worker = None
+        self._frame_times: list[float] = []
+        self.save_worker: Optional[SaveWorker] = None
         self._resume_preview_after_save = False
-        self._last_save_path = None
-        self._last_metadata_path = None
+        self._last_save_path: Optional[str] = None
+        self._last_metadata_path: Optional[str] = None
         self._frame_error_reported = False
         self.auto_levels_enabled = True
         self.filter_smoothing = False
@@ -721,7 +755,7 @@ class CameraWindow(Gtk.Window):
         self.filter_mavg_sub_enabled = False
         self.preview_keep_aspect = True
         self.show_fps_overlay = True
-        self.fps_label.set_visible(self.show_fps_overlay)
+        self.fps_label.setVisible(self.show_fps_overlay)
 
         self._updating_exp_slider = False
         self._updating_exp_entry = False
@@ -730,7 +764,7 @@ class CameraWindow(Gtk.Window):
         try:
             emin, emax, estep, edef = self.camera.get_exposure_range()
             self.exp_min = max(emin, 1e-12)
-            self.exp_max = max(emax, self.exp_min * 1.0)
+            self.exp_max = max(emax, self.exp_min)
             self.exp_step = estep
             self.exp_default = edef
         except Exception:
@@ -739,21 +773,18 @@ class CameraWindow(Gtk.Window):
             self.exp_step = 1e-6
             self.exp_default = 1.0
 
-        self.exp_slider.set_range(0, self.SMAX)
-
-        def exp_to_pos(exp):
+        def exp_to_pos(exp: float):
             exp = max(self.exp_min, min(self.exp_max, max(exp, 1e-12)))
             span = math.log(self.exp_max) - math.log(self.exp_min)
             if span <= 0:
                 return 0
             return int(round((math.log(exp) - math.log(self.exp_min)) / span * self.SMAX))
 
-        def pos_to_exp(pos):
+        def pos_to_exp(pos: float):
             t = float(pos) / float(self.SMAX)
             val = math.exp(math.log(self.exp_min) + t * (math.log(self.exp_max) - math.log(self.exp_min)))
             if self.exp_step and self.exp_step > 0:
-                q = round(val / self.exp_step) * self.exp_step
-                val = q
+                val = round(val / self.exp_step) * self.exp_step
             return max(self.exp_min, min(self.exp_max, float(val)))
 
         self._exp_to_pos = exp_to_pos
@@ -775,46 +806,46 @@ class CameraWindow(Gtk.Window):
             width = int(getattr(self.camera, 'width', 0) or 0)
             height = int(getattr(self.camera, 'height', 0) or 0)
             if width > 0:
-                self.spin_hsize.set_value(width)
+                self.spin_hsize.setValue(width)
             if height > 0:
-                self.spin_vsize.set_value(height)
+                self.spin_vsize.setValue(height)
         except Exception:
             pass
 
-        self.show_all()
+        self.preview_area.set_keep_aspect(self.preview_keep_aspect)
         self.show_status('Ready')
 
-    def _set_spin_value(self, spin, value, attr):
+    # ------------------------------------------------------------------
+    # UI helpers
+    def _set_spin_value(self, spin: QtWidgets.QSpinBox, value: int, attr: str):
         flag = getattr(self, attr)
         setattr(self, attr, True)
-        spin.set_value(value)
+        spin.setValue(int(value))
         setattr(self, attr, flag)
 
-    def _set_slider_value(self, value):
+    def _set_slider_value(self, value: int):
         self._updating_exp_slider = True
-        self.exp_slider.set_value(value)
+        self.exp_slider.setValue(int(value))
         self._updating_exp_slider = False
 
-    def _set_exp_entry(self, value):
+    def _set_exp_entry(self, value: float):
         self._updating_exp_entry = True
-        self.exp_entry.set_text(f"{value:.6g}")
+        self.exp_entry.setText(f"{value:.6g}")
         self._updating_exp_entry = False
 
     def show_status(self, message: str, timeout_ms: int = 0):
-        if self._status_timeout_id:
-            GLib.source_remove(self._status_timeout_id)
-            self._status_timeout_id = None
-        self.status.remove_all(self.status_context)
-        self.status.push(self.status_context, message)
+        if self._status_timer.isActive():
+            self._status_timer.stop()
+        self.status.showMessage(message)
         if timeout_ms > 0:
-            self._status_timeout_id = GLib.timeout_add(timeout_ms, self._clear_status)
+            self._status_timer.start(timeout_ms)
 
     def _clear_status(self):
-        self.status.remove_all(self.status_context)
-        self._status_timeout_id = None
-        return False
+        self.status.clearMessage()
 
-    def on_destroy(self, _widget):
+    # ------------------------------------------------------------------
+    # Qt life-cycle
+    def closeEvent(self, event: QtGui.QCloseEvent):
         if self.save_worker:
             self.save_worker.request_stop()
         if self.worker:
@@ -823,17 +854,19 @@ class CameraWindow(Gtk.Window):
             self.camera.stop()
         except Exception:
             pass
-        Gtk.main_quit()
+        super().closeEvent(event)
 
-    def on_start_stop(self, _button):
+    # ------------------------------------------------------------------
+    # Button + widget callbacks
+    def on_start_stop(self):
         if not self.running:
             try:
                 self.camera.start()
-            except Exception as e:
-                self.show_error('Error', f'Failed to start: {e}')
+            except Exception as exc:
+                self.show_error('Error', f'Failed to start: {exc}')
                 return
             self.worker.start()
-            self.btn_start.set_label('Stop')
+            self.btn_start.setText('Stop')
             self.running = True
             self.show_status('Running')
         else:
@@ -842,7 +875,7 @@ class CameraWindow(Gtk.Window):
                 self.camera.stop()
             except Exception:
                 pass
-            self.btn_start.set_label('Start')
+            self.btn_start.setText('Start')
             self.running = False
             self.show_status('Stopped')
 
@@ -883,8 +916,8 @@ class CameraWindow(Gtk.Window):
             if self.auto_levels_enabled:
                 self._auto_adjust_levels_from_hist(hist)
 
-        self._latest_pixbuf = self._numpy_to_pixbuf(display_rgb)
-        self.preview_area.queue_draw()
+        self._latest_pixmap = self._numpy_to_qpixmap(display_rgb)
+        self.preview_area.set_pixmap(self._latest_pixmap)
 
         now = time.time()
         self._frame_times.append(now)
@@ -896,96 +929,60 @@ class CameraWindow(Gtk.Window):
             if dt > 0:
                 fps = (len(self._frame_times) - 1) / dt
         h, w, _ = display_rgb.shape
-        self.fps_label.set_text(f'FPS: {fps:.1f}  ({w}x{h})')
+        self.fps_label.setText(f'FPS: {fps:.1f}  ({w}x{h})')
 
-    def _numpy_to_pixbuf(self, img_rgb: np.ndarray):
+    def _numpy_to_qpixmap(self, img_rgb: np.ndarray) -> QtGui.QPixmap:
         arr = np.ascontiguousarray(img_rgb, dtype=np.uint8)
+        self._latest_image_bytes = arr  # keep buffer alive
         h, w, _ = arr.shape
-        data = GLib.Bytes.new(arr.tobytes())
-        pixbuf = GdkPixbuf.Pixbuf.new_from_bytes(data, GdkPixbuf.Colorspace.RGB, False, 8, w, h, w * 3)
-        pixbuf._bytes_ref = data  # keep reference alive
-        return pixbuf
+        image = QtGui.QImage(arr.data, w, h, w * 3, QtGui.QImage.Format_RGB888)
+        return QtGui.QPixmap.fromImage(image)
 
-    def _on_preview_draw(self, widget, cr: cairo.Context):
-        alloc = widget.get_allocation()
-        cr.set_source_rgb(0, 0, 0)
-        cr.rectangle(0, 0, alloc.width, alloc.height)
-        cr.fill()
-        if not self._latest_pixbuf:
-            return False
-        pixbuf = self._latest_pixbuf
-        img_w = pixbuf.get_width()
-        img_h = pixbuf.get_height()
-        if img_w <= 0 or img_h <= 0:
-            return False
-        if alloc.width <= 0 or alloc.height <= 0:
-            return False
-        if self.preview_keep_aspect:
-            scale = min(alloc.width / img_w, alloc.height / img_h)
-            scale = max(scale, 1.0 if alloc.width >= img_w and alloc.height >= img_h else scale)
-            new_w = max(1, int(img_w * scale))
-            new_h = max(1, int(img_h * scale))
-        else:
-            new_w = max(1, alloc.width)
-            new_h = max(1, alloc.height)
-        draw_pixbuf = pixbuf if (new_w == img_w and new_h == img_h) else \
-            pixbuf.scale_simple(new_w, new_h, GdkPixbuf.InterpType.BILINEAR)
-        x = (alloc.width - new_w) / 2
-        y = (alloc.height - new_h) / 2
-        Gdk.cairo_set_source_pixbuf(cr, draw_pixbuf, x, y)
-        cr.paint()
-        return False
-
-    def on_hist_levels_changed(self, _widget, low, high):
+    def on_hist_levels_changed(self, low: int, high: int):
         self._set_display_levels(low, high, source='hist')
 
-    def on_filter_smooth_toggled(self, button):
-        self.filter_smoothing = bool(button.get_active())
+    def on_filter_smooth_toggled(self, checked: bool):
+        self.filter_smoothing = bool(checked)
 
-    def on_filter_sharpen_toggled(self, button):
-        self.filter_sharpen = bool(button.get_active())
-        if not self.filter_sharpen:
-            # nothing special, but keep placeholder for future cleanups
-            pass
+    def on_filter_sharpen_toggled(self, checked: bool):
+        self.filter_sharpen = bool(checked)
 
-    def on_filter_mavg_toggled(self, button):
-        self.filter_mavg_enabled = bool(button.get_active())
+    def on_filter_mavg_toggled(self, checked: bool):
+        self.filter_mavg_enabled = bool(checked)
         if not self.filter_mavg_enabled:
             self.filter_mavg.reset()
 
-    def on_display_show_fps_toggled(self, button):
-        self.show_fps_overlay = bool(button.get_active())
-        self.fps_label.set_visible(self.show_fps_overlay)
+    def on_display_show_fps_toggled(self, checked: bool):
+        self.show_fps_overlay = bool(checked)
+        self.fps_label.setVisible(self.show_fps_overlay)
 
-    def on_display_keep_aspect_toggled(self, button):
-        self.preview_keep_aspect = bool(button.get_active())
-        self.preview_area.queue_draw()
+    def on_display_keep_aspect_toggled(self, checked: bool):
+        self.preview_keep_aspect = bool(checked)
+        self.preview_area.set_keep_aspect(self.preview_keep_aspect)
 
-    def on_filter_mavg_sub_toggled(self, button):
-        self.filter_mavg_sub_enabled = bool(button.get_active())
+    def on_filter_mavg_sub_toggled(self, checked: bool):
+        self.filter_mavg_sub_enabled = bool(checked)
         if not self.filter_mavg_sub_enabled:
             self.filter_mavg_sub.reset()
 
-    def on_filter_mavg_sub_params_changed(self, _spin):
-        length = int(self.spin_mavg_length.get_value())
+    def on_filter_mavg_sub_params_changed(self, _value: int):
+        length = int(self.spin_mavg_length.value())
         self.filter_mavg_sub.set_params(length=length)
 
-    def on_filter_mavg_sub_norm_toggled(self, button):
-        self.filter_mavg_sub.set_params(normalize=bool(button.get_active()))
+    def on_filter_mavg_sub_norm_toggled(self, checked: bool):
+        self.filter_mavg_sub.set_params(normalize=bool(checked))
 
-    def on_black_level_changed(self, spin):
+    def on_black_level_changed(self, value: int):
         if self._block_black_spin:
             return
-        value = int(spin.get_value())
         high = self.display_max
         if value >= high:
             high = min(65535, value + 1)
         self._set_display_levels(value, high, source='black_spin')
 
-    def on_white_level_changed(self, spin):
+    def on_white_level_changed(self, value: int):
         if self._block_white_spin:
             return
-        value = int(spin.get_value())
         low = self.display_min
         if value >= 65535:
             value = 65535
@@ -993,9 +990,9 @@ class CameraWindow(Gtk.Window):
             low = max(0, value - 1)
         self._set_display_levels(low, value, source='white_spin')
 
-    def _set_display_levels(self, low, high, source=None):
+    def _set_display_levels(self, low: int, high: int, source: Optional[str] = None):
         if source in ('hist', 'black_spin', 'white_spin') and self.auto_levels_enabled:
-            self.auto_levels_check.set_active(False)
+            self.auto_levels_check.setChecked(False)
         low = max(0, min(int(low), 65535))
         high = max(low + 1, min(int(high), 65535))
         if low == self.display_min and high == self.display_max:
@@ -1011,8 +1008,8 @@ class CameraWindow(Gtk.Window):
         if self.worker:
             self.worker.set_display_levels(low, high)
 
-    def on_auto_levels_toggled(self, button):
-        self.auto_levels_enabled = bool(button.get_active())
+    def on_auto_levels_toggled(self, checked: bool):
+        self.auto_levels_enabled = bool(checked)
         if self.auto_levels_enabled and self.last_hist is not None:
             self._auto_adjust_levels_from_hist(self.last_hist)
 
@@ -1038,20 +1035,20 @@ class CameraWindow(Gtk.Window):
         high_level = int(max(low_level + 1, min(65535, round((high_idx + 1) * bin_width))))
         self._set_display_levels(low_level, high_level, source='auto')
 
-    def on_preview_fps_changed(self, spin):
+    def on_preview_fps_changed(self, value: int):
         try:
-            self.worker.set_preview_fps(float(spin.get_value()))
-            self.show_status(f'Preview FPS limited to {int(spin.get_value())}', 3000)
+            self.worker.set_preview_fps(float(value))
+            self.show_status(f'Preview FPS limited to {int(value)}', 3000)
         except Exception:
             pass
 
-    def on_save_burst(self, _button):
+    def on_save_burst(self):
         if self.save_worker is not None:
             self.show_info('Saving', 'A save operation is already running.')
             return
 
-        frame_limit = int(self.spin_save_frames.get_value())
-        duration_limit = float(self.spin_save_secs.get_value())
+        frame_limit = int(self.spin_save_frames.value())
+        duration_limit = float(self.spin_save_secs.value())
         if frame_limit <= 0 and duration_limit <= 0:
             self.show_error('Invalid settings', 'Set either a positive frame count or duration.')
             return
@@ -1071,49 +1068,37 @@ class CameraWindow(Gtk.Window):
             except Exception:
                 pass
             self.running = False
-            self.btn_start.set_label('Start')
+            self.btn_start.setText('Start')
             self.show_status('Preview paused for saving...', 3000)
 
-        self.btn_capture.set_sensitive(False)
+        self.btn_capture.setEnabled(False)
         self.save_worker = SaveWorker(
             self.camera,
             fname,
             frame_limit,
-            duration_limit,
-            progress_cb=self.on_save_progress,
-            finished_cb=self.on_save_finished
+            duration_limit
         )
+        self.save_worker.progress.connect(self.on_save_progress)
+        self.save_worker.finished.connect(self.on_save_finished)
         self._last_metadata_path = self.save_worker.metadata_path
         self.save_worker.start()
         self.show_status('Saving frames...', 0)
 
-    def _choose_save_file(self, default_name: str):
-        dialog = Gtk.FileChooserDialog(
-            title='Save burst',
-            parent=self,
-            action=Gtk.FileChooserAction.SAVE,
+    def _choose_save_file(self, default_name: str) -> Optional[str]:
+        filename, _ = QtWidgets.QFileDialog.getSaveFileName(
+            self,
+            'Save burst',
+            default_name,
+            'Binary files (*.bin)'
         )
-        dialog.add_buttons(
-            Gtk.STOCK_CANCEL, Gtk.ResponseType.CANCEL,
-            Gtk.STOCK_SAVE, Gtk.ResponseType.OK
-        )
-        dialog.set_current_name(default_name)
-        filter_bin = Gtk.FileFilter()
-        filter_bin.set_name('Binary files (*.bin)')
-        filter_bin.add_pattern('*.bin')
-        dialog.add_filter(filter_bin)
-        filename = None
-        if dialog.run() == Gtk.ResponseType.OK:
-            filename = dialog.get_filename()
-        dialog.destroy()
-        return filename
+        return filename or None
 
     def on_save_progress(self, frames_saved: int, elapsed: float):
         rate = (frames_saved / elapsed) if elapsed > 0 else 0.0
         self.show_status(f'Saving... frames={frames_saved} ({rate:.1f} FPS)', 0)
 
     def on_save_finished(self, success: bool, error: str, frames_saved: int):
-        self.btn_capture.set_sensitive(True)
+        self.btn_capture.setEnabled(True)
         if success:
             msg = f'Saved {frames_saved} frames to:\n{self._last_save_path}'
             if self._last_metadata_path:
@@ -1130,41 +1115,40 @@ class CameraWindow(Gtk.Window):
         if self._resume_preview_after_save:
             self._resume_preview_after_save = False
             if not self.running:
-                self.on_start_stop(None)
+                self.on_start_stop()
 
         self.save_worker = None
 
-    def on_exp_slider_changed(self, scale):
+    def on_exp_slider_changed(self, value: int):
         if self._updating_exp_slider:
             return
-        pos = scale.get_value()
+        pos = value
         try:
             exp = self._pos_to_exp(pos)
-        except Exception as e:
-            self.show_error('Mapping error', f'Failed to map slider to exposure: {e}')
+        except Exception as exc:
+            self.show_error('Mapping error', f'Failed to map slider to exposure: {exc}')
             return
         self._set_exp_entry(exp)
         try:
             self.camera.set_exposure(float(exp))
             self.current_exposure = float(exp)
             self.show_status(f'Exposure set to {exp:.6g} s', 3000)
-        except Exception as e:
+        except Exception as exc:
             self._set_slider_value(self._exp_to_pos(self.current_exposure))
             self._set_exp_entry(self.current_exposure)
-            self.show_error('Exposure failed', f'Failed to set exposure: {e}')
+            self.show_error('Exposure failed', f'Failed to set exposure: {exc}')
 
-    def on_exp_entry_activated(self, _entry):
+    def on_exp_entry_activated(self):
         self._apply_exp_entry()
 
-    def on_exp_entry_focus_out(self, _entry, _event):
+    def on_exp_entry_editing_finished(self):
         self._apply_exp_entry()
-        return False
 
     def _apply_exp_entry(self):
         if self._updating_exp_entry:
             return
         try:
-            v = float(self.exp_entry.get_text())
+            v = float(self.exp_entry.text())
         except ValueError:
             self.show_error('Exposure error', 'Invalid exposure value.')
             self._set_exp_entry(self.current_exposure)
@@ -1177,23 +1161,24 @@ class CameraWindow(Gtk.Window):
             self.current_exposure = float(v)
             self._set_slider_value(self._exp_to_pos(v))
             self._set_exp_entry(v)
-        except Exception as e:
+            self.show_status(f'Exposure set to {v:.6g} s', 3000)
+        except Exception as exc:
             self._set_exp_entry(self.current_exposure)
             self._set_slider_value(self._exp_to_pos(self.current_exposure))
-            self.show_error('Exposure failed', f'Failed to set exposure: {e}')
+            self.show_error('Exposure failed', f'Failed to set exposure: {exc}')
 
-    def on_apply_roi(self, _button):
-        hpos = int(self.spin_hpos.get_value())
-        vpos = int(self.spin_vpos.get_value())
-        hsize = int(self.spin_hsize.get_value())
-        vsize = int(self.spin_vsize.get_value())
+    def on_apply_roi(self):
+        hpos = int(self.spin_hpos.value())
+        vpos = int(self.spin_vpos.value())
+        hsize = int(self.spin_hsize.value())
+        vsize = int(self.spin_vsize.value())
         was_running = self.running
         if was_running:
             self._pause_preview('Pausing preview to apply ROI...')
         try:
             self.camera.set_subarray(hpos, vpos, hsize, vsize, mode=2)
-        except Exception as e:
-            self.show_error('ROI failed', f'Failed to set ROI: {e}')
+        except Exception as exc:
+            self.show_error('ROI failed', f'Failed to set ROI: {exc}')
             if was_running:
                 self._resume_preview('Preview resumed (ROI unchanged)')
             return
@@ -1204,11 +1189,11 @@ class CameraWindow(Gtk.Window):
         else:
             self.show_status(msg, 5000)
 
-    def on_maximize_roi(self, _button):
+    def on_maximize_roi(self):
         try:
             info = self.camera.get_subarray_info()
-        except Exception as e:
-            self.show_error('ROI failed', f'Failed to query camera info: {e}')
+        except Exception as exc:
+            self.show_error('ROI failed', f'Failed to query camera info: {exc}')
             return
 
         def _extract_max(attr_tuple):
@@ -1229,31 +1214,13 @@ class CameraWindow(Gtk.Window):
             self.show_error('ROI failed', 'Camera did not report maximum dimensions.')
             return
 
-        self.spin_hpos.set_value(0)
-        self.spin_vpos.set_value(0)
-        self.spin_hsize.set_value(max_width)
-        self.spin_vsize.set_value(max_height)
-        self.on_apply_roi(None)
+        self.spin_hpos.setValue(0)
+        self.spin_vpos.setValue(0)
+        self.spin_hsize.setValue(max_width)
+        self.spin_vsize.setValue(max_height)
+        self.on_apply_roi()
 
-    def show_error(self, title: str, message: str):
-        self._show_message(Gtk.MessageType.ERROR, title, message)
-
-    def show_info(self, title: str, message: str):
-        self._show_message(Gtk.MessageType.INFO, title, message)
-
-    def _show_message(self, msg_type, title, message):
-        dialog = Gtk.MessageDialog(
-            transient_for=self,
-            flags=0,
-            message_type=msg_type,
-            buttons=Gtk.ButtonsType.OK,
-            text=title
-        )
-        dialog.format_secondary_text(message)
-        dialog.run()
-        dialog.destroy()
-
-    def _pause_preview(self, message='Preview paused'):
+    def _pause_preview(self, message: str = 'Preview paused'):
         if not self.running:
             return False
         self.worker.stop()
@@ -1262,33 +1229,42 @@ class CameraWindow(Gtk.Window):
         except Exception:
             pass
         self.running = False
-        self.btn_start.set_label('Start')
+        self.btn_start.setText('Start')
         self.show_status(message, 3000)
         return True
 
-    def _resume_preview(self, message='Preview resumed'):
+    def _resume_preview(self, message: str = 'Preview resumed'):
         try:
             self.camera.start()
-        except Exception as e:
-            self.show_error('Restart failed', f'Failed to restart camera: {e}')
+        except Exception as exc:
+            self.show_error('Restart failed', f'Failed to restart camera: {exc}')
             return False
         self.worker.start()
         self.running = True
-        self.btn_start.set_label('Stop')
+        self.btn_start.setText('Stop')
         self.show_status(message, 5000)
         return True
 
+    # ------------------------------------------------------------------
+    # Message helpers
+    def show_error(self, title: str, message: str):
+        QtWidgets.QMessageBox.critical(self, title, message)
+
+    def show_info(self, title: str, message: str):
+        QtWidgets.QMessageBox.information(self, title, message)
+
 
 def main():
+    app = QtWidgets.QApplication(sys.argv)
     cam = CameraDevice(cam_index=0)
     try:
         cam.init()
-    except Exception as e:
-        print('Failed to initialize camera:', e)
+    except Exception as exc:
+        print('Failed to initialize camera:', exc)
         return
-
     win = CameraWindow(cam)
-    Gtk.main()
+    win.show()
+    sys.exit(app.exec())
 
 
 if __name__ == '__main__':
